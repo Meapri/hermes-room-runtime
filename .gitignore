@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# never commit runtime data, brains, or secrets
+data/
+rooms/
+brain/
+*.env
+.env
+secrets/
+*.key
+*.token

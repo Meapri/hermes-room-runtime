@@ -1,0 +1,17 @@
+# Example Hermes config seeded into each room container per turn.
+# The manager force-writes this so model/provider/limits stay consistent.
+model:
+  provider: antigravity            # or: anthropic, openai, google, ...
+  base_url: http://host.docker.internal:8765/v1
+  api_key: injected-at-runtime
+approvals:
+  mode: off                        # non-interactive: no human approval prompts
+agent:
+  max_turns: 10
+terminal:
+  timeout: 120
+compression:
+  enabled: false
+display:
+  tool_progress: false
+  show_cost: false
