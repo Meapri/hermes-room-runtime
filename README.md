@@ -141,3 +141,4 @@ consumer token이나 lease token이 Hermes 환경으로 내려갈 수 없다. �
 - 오래된 카톡식 `HermesRoomManager`와 `--continue` API는 0.2에서 제거했다.
 
 세부 보안 가정과 운영 체크리스트는 [SECURITY.md](SECURITY.md)를 참고한다.
+Ubuntu 지속 실행 예시는 [ops/systemd/README.md](ops/systemd/README.md)에 있다.

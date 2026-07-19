@@ -194,6 +194,8 @@ class HermesJobRuntime:
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--read-only",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
             "--tmpfs",
             "/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs",
