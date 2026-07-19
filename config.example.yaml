@@ -1,17 +1,28 @@
-# Example Hermes config seeded into each room container per turn.
-# The manager force-writes this so model/provider/limits stay consistent.
+# Copied into a fresh per-job HERMES_HOME. Secrets are injected only into the
+# `docker exec` process and must not be written here.
 model:
-  provider: antigravity            # or: anthropic, openai, google, ...
-  base_url: http://host.docker.internal:8765/v1
-  api_key: injected-at-runtime
+  provider: openai
+  base_url: http://model-proxy:8765/v1
+  api_key: ${OPENAI_API_KEY}
+
 approvals:
-  mode: off                        # non-interactive: no human approval prompts
+  mode: off
+
 agent:
-  max_turns: 10
+  max_turns: 20
+
 terminal:
+  backend: local
   timeout: 120
+  env_passthrough: []
+
+delegation:
+  max_concurrent_children: 3
+  max_spawn_depth: 1
+
 compression:
   enabled: false
+
 display:
   tool_progress: false
   show_cost: false

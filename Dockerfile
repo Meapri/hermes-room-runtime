@@ -1,26 +1,23 @@
-# Minimal, hardened container image for running a Hermes agent in isolation.
-# The agent code itself comes from the public `hermes-agent` PyPI package;
-# model API keys are injected at runtime via -e (never baked into the image).
-FROM python:3.11-slim
+FROM python:3.11.13-slim@sha256:9bffe4353b925a1656688797ebc68f9c525e79b1d377a764d232182a519eeec4
 
-# Non-root user — the agent never runs as root inside the container.
-RUN useradd --create-home --shell /bin/bash user
+ARG HERMES_AGENT_VERSION=0.18.2
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git xz-utils \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir hermes-agent
+RUN useradd --uid 1000 --create-home --shell /bin/bash user \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git ripgrep xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir "hermes-agent==${HERMES_AGENT_VERSION}"
 
 WORKDIR /home/user
-RUN mkdir -p /home/user/.hermes /home/user/workspace && chown -R user:user /home/user
+RUN mkdir -p /home/user/workspace && chown -R user:user /home/user
 
 USER user
 ENV HOME=/home/user \
-    HERMES_HOME=/home/user/.hermes \
-    HERMES_YOLO_MODE=1 \
-    HERMES_SKIP_UPDATES=1
+    HERMES_SKIP_UPDATES=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Started as a persistent container (see manager); commands run via `docker exec`.
-ENTRYPOINT ["hermes"]
-CMD ["--help"]
+# The runtime overrides this with the same command explicitly. Keeping the image
+# entrypoint-free avoids `hermes tail -f /dev/null` argument composition.
+ENTRYPOINT []
+CMD ["tail", "-f", "/dev/null"]
