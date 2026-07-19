@@ -85,7 +85,7 @@ class HubEvidenceLoader:
                 "Authorization": f"Bearer {_read_token(self.token_file)}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "hermes-room-runtime/0.2.0",
+                "User-Agent": "hermes-room-runtime/0.3.0",
                 **(headers or {}),
             },
         )
@@ -239,6 +239,34 @@ class HubAgentJobClient(HubEvidenceLoader):
             },
         )
         return LeasedHubJob.from_response(payload)
+
+    def worker_heartbeat(
+        self,
+        *,
+        worker_id: str,
+        task_kinds: list[str],
+        slots: int,
+        runtime_version: str,
+        heartbeat_ttl_seconds: int = 60,
+    ) -> None:
+        response = self._request(
+            "POST",
+            "/api/agent/v1/workers/heartbeat",
+            payload={
+                "worker_id": worker_id,
+                "task_kinds": task_kinds,
+                "slots": slots,
+                "runtime_version": runtime_version,
+                "heartbeat_ttl_seconds": heartbeat_ttl_seconds,
+            },
+        )
+        worker = response.get("worker")
+        if (
+            response.get("api_version") != "agent-runtime-v1"
+            or not isinstance(worker, dict)
+            or worker.get("worker_id") != worker_id
+        ):
+            raise HubApiError(0, "runtime-heartbeat-contract-invalid")
 
     def heartbeat(
         self,

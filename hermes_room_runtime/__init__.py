@@ -5,6 +5,8 @@ from .models import JobRequest, JobResult, JobStatus, RuntimeHealth
 from .runtime import HermesJobRuntime, RuntimeConfig
 from .worker import HubJobWorker
 
+RUNTIME_VERSION = "0.3.0"
+
 __all__ = [
     "HermesJobRuntime",
     "HubApiError",
@@ -17,4 +19,5 @@ __all__ = [
     "RuntimeConfig",
     "RuntimeHealth",
     "LeasedHubJob",
+    "RUNTIME_VERSION",
 ]

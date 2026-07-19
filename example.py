@@ -1,7 +1,7 @@
 """Minimal Actverse job example.
 
 Build first:
-    docker build -t hermes-room-runtime:0.2.0 .
+    docker build -t hermes-room-runtime:0.3.0 .
 """
 
 import asyncio
@@ -14,7 +14,7 @@ from hermes_room_runtime import HermesJobRuntime, JobRequest, RuntimeConfig
 async def main() -> None:
     runtime = HermesJobRuntime(
         RuntimeConfig(
-            image="hermes-room-runtime:0.2.0",
+            image="hermes-room-runtime:0.3.0",
             state_root=Path("./runtime-data"),
             slots=2,
             config_path=Path("config.example.yaml"),

@@ -105,6 +105,8 @@ def build_worker_from_environment() -> tuple[HubJobWorker, float]:
         task_kinds=task_kinds,
         lease_seconds=_integer("HUB_LEASE_SECONDS", 120),
         job_timeout_seconds=_float("HERMES_JOB_TIMEOUT_SECONDS", 300),
+        runtime_heartbeat_seconds=_float("HUB_RUNTIME_HEARTBEAT_SECONDS", 20),
+        runtime_heartbeat_ttl_seconds=_integer("HUB_RUNTIME_HEARTBEAT_TTL_SECONDS", 60),
     )
     return worker, _float("HUB_POLL_SECONDS", 2)
 

@@ -13,6 +13,7 @@ from .models import JobRequest, JobResult, JobStatus
 from .runtime import HermesJobRuntime
 
 log = logging.getLogger(__name__)
+RUNTIME_VERSION = "0.3.0"
 
 
 def _safe_exception_location(exc: BaseException) -> str:
@@ -54,6 +55,8 @@ class HubJobWorker:
     task_kinds: tuple[str, ...] = SUPPORTED_TASK_KINDS
     lease_seconds: int = 120
     job_timeout_seconds: float = 300.0
+    runtime_heartbeat_seconds: float = 20.0
+    runtime_heartbeat_ttl_seconds: int = 60
 
     def __post_init__(self) -> None:
         if not 3 <= len(self.worker_id) <= 128:
@@ -64,6 +67,12 @@ class HubJobWorker:
             raise ValueError("lease_seconds must be between 30 and 900")
         if not 1 <= self.job_timeout_seconds <= 1800:
             raise ValueError("job_timeout_seconds must be between 1 and 1800")
+        if not 5 <= self.runtime_heartbeat_seconds <= 120:
+            raise ValueError("runtime_heartbeat_seconds must be between 5 and 120")
+        if not 30 <= self.runtime_heartbeat_ttl_seconds <= 300:
+            raise ValueError("runtime_heartbeat_ttl_seconds must be between 30 and 300")
+        if self.runtime_heartbeat_ttl_seconds < self.runtime_heartbeat_seconds * 2:
+            raise ValueError("runtime heartbeat TTL must cover at least two heartbeat intervals")
 
     async def _heartbeat_loop(self, job: LeasedHubJob, stopped: asyncio.Event) -> None:
         interval = max(10, self.lease_seconds // 3)
@@ -72,12 +81,61 @@ class HubJobWorker:
                 await asyncio.wait_for(stopped.wait(), timeout=interval)
                 return
             except TimeoutError:
-                await asyncio.to_thread(
-                    self.client.heartbeat,
-                    job,
-                    worker_id=self.worker_id,
-                    lease_seconds=self.lease_seconds,
+                try:
+                    await asyncio.to_thread(
+                        self.client.heartbeat,
+                        job,
+                        worker_id=self.worker_id,
+                        lease_seconds=self.lease_seconds,
+                    )
+                except HubApiError as exc:
+                    log.warning(
+                        "Hub job heartbeat failed status=%s code=%s",
+                        exc.status_code,
+                        exc.code,
+                    )
+
+    async def _runtime_heartbeat_loop(self, stopped: asyncio.Event) -> None:
+        while not stopped.is_set():
+            try:
+                announced = await self._announce_runtime()
+                if not announced:
+                    log.warning("Hermes runtime is not ready; availability heartbeat skipped")
+            except HubApiError as exc:
+                log.warning(
+                    "Hub runtime heartbeat failed status=%s code=%s",
+                    exc.status_code,
+                    exc.code,
                 )
+            except Exception as exc:
+                log.error(
+                    "Hermes runtime heartbeat failed error_type=%s location=%s",
+                    type(exc).__name__,
+                    _safe_exception_location(exc),
+                )
+            try:
+                await asyncio.wait_for(
+                    stopped.wait(),
+                    timeout=self.runtime_heartbeat_seconds,
+                )
+            except TimeoutError:
+                continue
+
+    async def _announce_runtime(self) -> bool:
+        if not await self.runtime.ensure():
+            return False
+        health = await self.runtime.health()
+        if health.running_slots < 1:
+            return False
+        await asyncio.to_thread(
+            self.client.worker_heartbeat,
+            worker_id=self.worker_id,
+            task_kinds=list(self.task_kinds),
+            slots=health.running_slots,
+            runtime_version=RUNTIME_VERSION,
+            heartbeat_ttl_seconds=self.runtime_heartbeat_ttl_seconds,
+        )
+        return True
 
     @staticmethod
     def _completion_status(result: JobResult) -> str:
@@ -157,6 +215,22 @@ class HubJobWorker:
                 ),
             )
             return True
+        except HubApiError:
+            raise
+        except Exception as exc:
+            # Provider/tool exception text can contain customer material. Record
+            # only bounded operational metadata in host logs and Hub state.
+            log.error(
+                "Hub worker leased job failed error_type=%s location=%s",
+                type(exc).__name__,
+                _safe_exception_location(exc),
+            )
+            await self._complete_failure(
+                job,
+                error_code="worker-internal-error",
+                summary="The isolated worker could not complete the job.",
+            )
+            return True
         finally:
             stopped.set()
             heartbeat.cancel()
@@ -166,24 +240,35 @@ class HubJobWorker:
     async def serve(self, *, poll_seconds: float = 2.0) -> None:
         if not 0.1 <= poll_seconds <= 60:
             raise ValueError("poll_seconds must be between 0.1 and 60")
-        while True:
-            try:
-                handled = await self.run_once()
-            except HubApiError as exc:
-                log.warning(
-                    "Hub worker request failed status=%s code=%s",
-                    exc.status_code,
-                    exc.code,
-                )
-                handled = False
-            except Exception as exc:
-                # Do not include the exception text: provider and tool failures
-                # can contain material that must not reach durable host logs.
-                log.error(
-                    "Hub worker job failed error_type=%s location=%s",
-                    type(exc).__name__,
-                    _safe_exception_location(exc),
-                )
-                handled = False
-            if not handled:
-                await asyncio.sleep(poll_seconds)
+        runtime_stopped = asyncio.Event()
+        runtime_heartbeat = asyncio.create_task(
+            self._runtime_heartbeat_loop(runtime_stopped),
+            name="hub-runtime-heartbeat",
+        )
+        try:
+            while True:
+                try:
+                    handled = await self.run_once()
+                except HubApiError as exc:
+                    log.warning(
+                        "Hub worker request failed status=%s code=%s",
+                        exc.status_code,
+                        exc.code,
+                    )
+                    handled = False
+                except Exception as exc:
+                    # Do not include the exception text: provider and tool failures
+                    # can contain material that must not reach durable host logs.
+                    log.error(
+                        "Hub worker job failed error_type=%s location=%s",
+                        type(exc).__name__,
+                        _safe_exception_location(exc),
+                    )
+                    handled = False
+                if not handled:
+                    await asyncio.sleep(poll_seconds)
+        finally:
+            runtime_stopped.set()
+            runtime_heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await runtime_heartbeat

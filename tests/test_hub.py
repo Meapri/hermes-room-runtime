@@ -152,3 +152,45 @@ def test_empty_agent_queue_has_no_lease_token(tmp_path: Path, monkeypatch) -> No
     )
 
     assert client.lease(worker_id="oracle-room-01", task_kinds=["incident-diagnosis"]) is None
+
+
+def test_worker_heartbeat_reports_only_bounded_runtime_capabilities(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client = _agent_client(tmp_path)
+    seen: dict = {}
+
+    def fake(request, **kwargs):
+        seen["url"] = request.full_url
+        seen["body"] = json.loads(request.data)
+        return _Response(
+            {
+                "api_version": "agent-runtime-v1",
+                "worker": {
+                    "worker_id": "oracle-room-01",
+                    "task_kinds": ["incident-diagnosis"],
+                    "slots": 2,
+                    "runtime_version": "0.3.0",
+                    "last_heartbeat_at": "2026-07-20T00:00:00Z",
+                    "available_until": "2026-07-20T00:01:00Z",
+                },
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake)
+    client.worker_heartbeat(
+        worker_id="oracle-room-01",
+        task_kinds=["incident-diagnosis"],
+        slots=2,
+        runtime_version="0.3.0",
+    )
+
+    assert seen["url"].endswith("/api/agent/v1/workers/heartbeat")
+    assert seen["body"] == {
+        "worker_id": "oracle-room-01",
+        "task_kinds": ["incident-diagnosis"],
+        "slots": 2,
+        "runtime_version": "0.3.0",
+        "heartbeat_ttl_seconds": 60,
+    }
+    assert "token" not in json.dumps(seen["body"]).lower()

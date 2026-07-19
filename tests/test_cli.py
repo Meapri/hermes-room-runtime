@@ -30,6 +30,8 @@ def test_worker_environment_keeps_hub_token_out_of_provider_environment(
     assert worker.client.token_file == token
     assert worker.runtime.config.provider_env == {"OPENAI_API_KEY": "provider-secret"}
     assert "HUB_WORKER_TOKEN" not in worker.runtime.config.provider_env
+    assert worker.runtime_heartbeat_seconds == 20
+    assert worker.runtime_heartbeat_ttl_seconds == 60
 
 
 @pytest.mark.parametrize(

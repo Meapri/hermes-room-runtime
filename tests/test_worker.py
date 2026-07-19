@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from hermes_room_runtime import HubJobWorker, JobResult, JobStatus, LeasedHubJob
 from hermes_room_runtime.worker import _safe_exception_location
@@ -23,6 +24,7 @@ class Client:
         self.job = job
         self.completed: dict | None = None
         self.heartbeat_count = 0
+        self.runtime_heartbeat: dict | None = None
 
     def lease(self, **kwargs):
         return self.job
@@ -42,10 +44,17 @@ class Client:
         self.completed = kwargs
         return {"job": {"status": kwargs["status"]}}
 
+    def worker_heartbeat(self, **kwargs):
+        self.runtime_heartbeat = kwargs
+
 
 @dataclass
 class Runtime:
     seen_request: object | None = None
+    running_slots: int = 2
+
+    def __post_init__(self):
+        self.config = SimpleNamespace(slots=2)
 
     async def run(self, request):
         self.seen_request = request
@@ -58,6 +67,23 @@ class Runtime:
             slot=0,
             duration_ms=25,
         )
+
+    async def ensure(self):
+        return True
+
+    async def health(self):
+        return SimpleNamespace(
+            ready=self.running_slots == 2,
+            configured_slots=2,
+            running_slots=self.running_slots,
+            reason=None if self.running_slots == 2 else "slots-not-ready",
+        )
+
+
+class FailingRuntime(Runtime):
+    async def run(self, request):
+        self.seen_request = request
+        raise RuntimeError("customer-looking-sensitive-runtime-detail")
 
 
 def test_worker_leases_hub_job_runs_stateless_runtime_and_completes_hub_record() -> None:
@@ -86,6 +112,37 @@ def test_worker_returns_false_without_creating_runtime_work_when_queue_is_empty(
     assert asyncio.run(worker.run_once()) is False
     assert runtime.seen_request is None
     assert client.completed is None
+
+
+def test_worker_marks_unexpected_runtime_failure_terminal_without_waiting_for_lease_expiry(
+    caplog,
+) -> None:
+    client = Client(_leased_job())
+    runtime = FailingRuntime()
+    worker = HubJobWorker(client=client, runtime=runtime, worker_id="oracle-room-01")
+
+    assert asyncio.run(worker.run_once()) is True
+
+    assert client.completed is not None
+    assert client.completed["status"] == "failed"
+    assert client.completed["error_code"] == "worker-internal-error"
+    assert client.completed["result"] == {
+        "contract_version": "actverse-hermes-job-result/1.0",
+        "summary": "The isolated worker could not complete the job.",
+    }
+    assert "customer-looking-sensitive-runtime-detail" not in caplog.text
+    assert _leased_job().lease_token not in caplog.text
+
+
+def test_worker_advertises_only_slots_that_are_actually_running() -> None:
+    client = Client(None)
+    runtime = Runtime(running_slots=1)
+    worker = HubJobWorker(client=client, runtime=runtime, worker_id="oracle-room-01")
+
+    assert asyncio.run(worker._announce_runtime()) is True
+    assert client.runtime_heartbeat is not None
+    assert client.runtime_heartbeat["slots"] == 1
+    assert client.runtime_heartbeat["runtime_version"] == "0.3.0"
 
 
 def test_safe_exception_location_never_includes_exception_message() -> None:

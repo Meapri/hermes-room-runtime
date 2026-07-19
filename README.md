@@ -62,7 +62,7 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 
-docker build -t hermes-room-runtime:0.2.0 .
+docker build -t hermes-room-runtime:0.3.0 .
 pytest
 ruff check .
 ```
@@ -98,6 +98,7 @@ bundle = hub.status_bundle(environment="prod")
 - `POST /api/agent/v1/jobs/lease`
 - `POST /api/agent/v1/jobs/{job_id}/heartbeat`
 - `POST /api/agent/v1/jobs/{job_id}/complete`
+- `POST /api/agent/v1/workers/heartbeat`
 
 `journey_bundle()`에 입력한 원본 analysis ID는 Hub 요청 본문에서만 쓰며 반환 번들에는 복사하지
 않는다. HTTP 오류에는 token이나 응답 본문을 포함하지 않는다.
