@@ -119,6 +119,7 @@ class HermesJobRuntime:
             "memory": self.config.memory,
             "cpus": self.config.cpus,
             "pids": self.config.pids_limit,
+            "host_group": os.getgid(),
             "mounts": sorted(
                 (str(Path(host).resolve()), container)
                 for host, container in self.config.read_only_mounts.items()
@@ -176,7 +177,10 @@ class HermesJobRuntime:
                 await self._docker("rm", "-f", name, timeout=30)
 
         slot_root = self._slot_root(slot)
-        (slot_root / "jobs").mkdir(parents=True, exist_ok=True, mode=0o700)
+        jobs_root = slot_root / "jobs"
+        jobs_root.mkdir(parents=True, exist_ok=True, mode=0o2770)
+        os.chmod(slot_root, 0o2770)
+        os.chmod(jobs_root, 0o2770)
         args = [
             "run",
             "-d",
@@ -194,8 +198,8 @@ class HermesJobRuntime:
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--read-only",
-            "--user",
-            f"{os.getuid()}:{os.getgid()}",
+            "--group-add",
+            str(os.getgid()),
             "--tmpfs",
             "/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs",
@@ -221,7 +225,8 @@ class HermesJobRuntime:
         async with self._ensure_lock:
             if self._ensured:
                 return bool(self._running_slots)
-            self.config.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.config.state_root.mkdir(parents=True, exist_ok=True, mode=0o2770)
+            os.chmod(self.config.state_root, 0o2770)
             self._available = asyncio.Queue()
             self._running_slots.clear()
             for slot in range(self.config.slots):
@@ -238,17 +243,19 @@ class HermesJobRuntime:
         work = job_root / "work"
         input_dir = job_root / "input"
         home = job_root / "home"
+        job_root.mkdir(parents=True, mode=0o2770)
         for directory in (hermes_home, work, input_dir, home):
-            directory.mkdir(parents=True, mode=0o700)
+            directory.mkdir(mode=0o2770)
+            os.chmod(directory, 0o2770)
         if self.config.config_path is not None:
             shutil.copyfile(self.config.config_path, hermes_home / "config.yaml")
-            os.chmod(hermes_home / "config.yaml", 0o600)
+            os.chmod(hermes_home / "config.yaml", 0o640)
         if self.config.auth_path is not None:
             shutil.copyfile(self.config.auth_path, hermes_home / "auth.json")
-            os.chmod(hermes_home / "auth.json", 0o600)
+            os.chmod(hermes_home / "auth.json", 0o640)
         evidence_path = input_dir / "evidence.json"
         evidence_path.write_bytes(request.evidence_bytes)
-        os.chmod(evidence_path, 0o600)
+        os.chmod(evidence_path, 0o640)
         return job_root, work
 
     def _write_env_file(self, job_root: Path, request: JobRequest) -> Path:

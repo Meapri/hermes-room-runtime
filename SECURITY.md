@@ -11,6 +11,10 @@ The runtime never mounts the Docker socket, host home, SSH directory, GitHub cre
 token into a slot. Provider credentials exist only in the `docker exec` process environment and must be scoped to
 the model proxy when possible.
 
+The image keeps its non-root user. The runtime adds only the host worker's primary group to the container and uses
+setgid job directories so that the host worker and image user can exchange bounded inputs and results without
+running Hermes as root or making the state tree world-readable.
+
 ## Required production controls
 
 1. Pin the runtime image by digest in `RuntimeConfig.image`.

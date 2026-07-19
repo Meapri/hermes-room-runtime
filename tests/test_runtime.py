@@ -41,7 +41,7 @@ def test_slot_creation_is_hardened_and_secret_free(tmp_path: Path) -> None:
     assert "--cap-drop=ALL" in run
     assert "--security-opt=no-new-privileges" in run
     assert "--read-only" in run
-    assert run[run.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+    assert run[run.index("--group-add") + 1] == str(os.getgid())
     assert "--network none" in joined
     assert "host.docker.internal" not in joined
     assert "secret-for-test" not in joined
