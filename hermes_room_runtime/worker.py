@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import traceback
 from dataclasses import dataclass
 
 from .hub import HubAgentJobClient, HubApiError, LeasedHubJob
@@ -12,6 +13,11 @@ from .models import JobRequest, JobResult, JobStatus
 from .runtime import HermesJobRuntime
 
 log = logging.getLogger(__name__)
+
+
+def _safe_exception_location(exc: BaseException) -> str:
+    frames = traceback.extract_tb(exc.__traceback__)
+    return " > ".join(f"{frame.name}:{frame.lineno}" for frame in frames[-4:]) or "unavailable"
 
 SUPPORTED_TASK_KINDS = (
     "incident-diagnosis",
@@ -170,10 +176,14 @@ class HubJobWorker:
                     exc.code,
                 )
                 handled = False
-            except Exception:
+            except Exception as exc:
                 # Do not include the exception text: provider and tool failures
                 # can contain material that must not reach durable host logs.
-                log.exception("Hub worker job failed", exc_info=False)
+                log.error(
+                    "Hub worker job failed error_type=%s location=%s",
+                    type(exc).__name__,
+                    _safe_exception_location(exc),
+                )
                 handled = False
             if not handled:
                 await asyncio.sleep(poll_seconds)

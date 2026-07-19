@@ -70,7 +70,7 @@ def test_run_uses_ephemeral_secret_and_cleans_job_state(tmp_path: Path) -> None:
             return 0, f"running|{runtime._spec_hash()}\n".encode(), b""
         if args[0] == "run":
             return 0, b"", b""
-        if args[0] == "exec":
+        if args[0] == "exec" and "--env-file" in args:
             env_path_seen = Path(args[args.index("--env-file") + 1])
             assert env_path_seen.stat().st_mode & 0o777 == 0o600
             assert "OPENAI_API_KEY=secret-for-test" in env_path_seen.read_text()
@@ -79,6 +79,16 @@ def test_run_uses_ephemeral_secret_and_cleans_job_state(tmp_path: Path) -> None:
             host_work = runtime._slot_root(0) / "jobs" / job_name / "work"
             (host_work / "result.json").write_text('{"summary":"ok"}', encoding="utf-8")
             return 0, b"done", b""
+        if args[0] == "exec":
+            assert args[-3:] == (
+                "sh",
+                "-c",
+                (
+                    "if [ -f result.json ] && [ ! -L result.json ]; "
+                    f"then chgrp {os.getgid()} result.json && chmod 0640 result.json; fi"
+                ),
+            )
+            return 0, b"", b""
         return 0, b"", b""
 
     runtime._docker = fake  # type: ignore[method-assign]
@@ -97,6 +107,21 @@ def test_run_uses_ephemeral_secret_and_cleans_job_state(tmp_path: Path) -> None:
     assert env_path_seen is not None and not env_path_seen.exists()
     jobs = runtime._slot_root(0) / "jobs"
     assert list(jobs.iterdir()) == []
+
+
+def test_job_directories_are_group_private_even_with_restrictive_umask(tmp_path: Path) -> None:
+    runtime = HermesJobRuntime(_config(tmp_path))
+    original_umask = os.umask(0o077)
+    try:
+        job_root, _ = runtime._prepare_job(
+            0,
+            JobRequest("job-private", "incident-diagnosis", "diagnose"),
+        )
+    finally:
+        os.umask(original_umask)
+
+    assert job_root.stat().st_mode & 0o777 == 0o770
+    assert all(path.stat().st_mode & 0o777 == 0o770 for path in job_root.iterdir())
 
 
 def test_timeout_restarts_slot_and_returns_it_to_pool(tmp_path: Path) -> None:

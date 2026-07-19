@@ -178,9 +178,9 @@ class HermesJobRuntime:
 
         slot_root = self._slot_root(slot)
         jobs_root = slot_root / "jobs"
-        jobs_root.mkdir(parents=True, exist_ok=True, mode=0o2770)
-        os.chmod(slot_root, 0o2770)
-        os.chmod(jobs_root, 0o2770)
+        jobs_root.mkdir(parents=True, exist_ok=True, mode=0o770)
+        os.chmod(slot_root, 0o770)
+        os.chmod(jobs_root, 0o770)
         args = [
             "run",
             "-d",
@@ -225,8 +225,9 @@ class HermesJobRuntime:
         async with self._ensure_lock:
             if self._ensured:
                 return bool(self._running_slots)
-            self.config.state_root.mkdir(parents=True, exist_ok=True, mode=0o2770)
-            os.chmod(self.config.state_root, 0o2770)
+            self.config.state_root.mkdir(parents=True, exist_ok=True, mode=0o770)
+            if stat.S_IMODE(self.config.state_root.stat().st_mode) != 0o770:
+                os.chmod(self.config.state_root, 0o770)
             self._available = asyncio.Queue()
             self._running_slots.clear()
             for slot in range(self.config.slots):
@@ -243,10 +244,11 @@ class HermesJobRuntime:
         work = job_root / "work"
         input_dir = job_root / "input"
         home = job_root / "home"
-        job_root.mkdir(parents=True, mode=0o2770)
+        job_root.mkdir(parents=True, mode=0o770)
+        os.chmod(job_root, 0o770)
         for directory in (hermes_home, work, input_dir, home):
-            directory.mkdir(mode=0o2770)
-            os.chmod(directory, 0o2770)
+            directory.mkdir(mode=0o770)
+            os.chmod(directory, 0o770)
         if self.config.config_path is not None:
             shutil.copyfile(self.config.config_path, hermes_home / "config.yaml")
             os.chmod(hermes_home / "config.yaml", 0o640)
@@ -403,6 +405,22 @@ class HermesJobRuntime:
             timed_out = returncode is None
             if timed_out:
                 await self._docker("restart", self._slot_name(slot), timeout=40)
+            else:
+                # Hermes may use a restrictive umask. The fixed, non-symlink check lets the
+                # host worker read the group-owned result without making it world-readable.
+                await self._docker(
+                    "exec",
+                    "-w",
+                    f"{container_job}/work",
+                    self._slot_name(slot),
+                    "sh",
+                    "-c",
+                    (
+                        "if [ -f result.json ] && [ ! -L result.json ]; "
+                        f"then chgrp {os.getgid()} result.json && chmod 0640 result.json; fi"
+                    ),
+                    timeout=10,
+                )
             result, result_error = self._load_result(work / "result.json")
             if timed_out:
                 status = JobStatus.TIMED_OUT

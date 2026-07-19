@@ -12,8 +12,8 @@ token into a slot. Provider credentials exist only in the `docker exec` process 
 the model proxy when possible.
 
 The image keeps its non-root user. The runtime adds only the host worker's primary group to the container and uses
-setgid job directories so that the host worker and image user can exchange bounded inputs and results without
-running Hermes as root or making the state tree world-readable.
+group-private job directories. A fixed post-run command assigns only `result.json` to that group with mode `0640`,
+so the host and image user can exchange bounded data without running Hermes as root or making it world-readable.
 
 ## Required production controls
 

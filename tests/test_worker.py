@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 
 from hermes_room_runtime import HubJobWorker, JobResult, JobStatus, LeasedHubJob
+from hermes_room_runtime.worker import _safe_exception_location
 
 
 def _leased_job() -> LeasedHubJob:
@@ -85,3 +86,13 @@ def test_worker_returns_false_without_creating_runtime_work_when_queue_is_empty(
     assert asyncio.run(worker.run_once()) is False
     assert runtime.seen_request is None
     assert client.completed is None
+
+
+def test_safe_exception_location_never_includes_exception_message() -> None:
+    try:
+        raise RuntimeError("credential-looking-sensitive-value")
+    except RuntimeError as exc:
+        location = _safe_exception_location(exc)
+
+    assert "test_safe_exception_location" in location
+    assert "credential-looking-sensitive-value" not in location

@@ -13,6 +13,12 @@ Keep the Hub worker token outside the repository. A minimal test deployment uses
 `HERMES_NETWORK_MODE=bridge`; production must replace this with a restricted model-proxy network. The worker token
 must contain only `agent-jobs:work` and the exact Hub read scopes required by the evidence loader.
 
+Create the group-private state root used by the host worker and the image's non-root user:
+
+```bash
+sudo install -d -o ubuntu -g ubuntu -m 0770 /var/lib/hermes-room-runtime
+```
+
 ```bash
 sudo install -o root -g root -m 0644 \
   ops/systemd/hermes-room-worker.service /etc/systemd/system/
