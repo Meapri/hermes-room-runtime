@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -142,7 +143,38 @@ def test_worker_advertises_only_slots_that_are_actually_running() -> None:
     assert asyncio.run(worker._announce_runtime()) is True
     assert client.runtime_heartbeat is not None
     assert client.runtime_heartbeat["slots"] == 1
-    assert client.runtime_heartbeat["runtime_version"] == "0.3.0"
+    assert client.runtime_heartbeat["runtime_version"] == "0.4.0"
+
+
+def test_serve_runs_up_to_configured_slot_count_concurrently() -> None:
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    state = {"active": 0, "maximum": 0}
+
+    class ConcurrentWorker(HubJobWorker):
+        async def run_once(self) -> bool:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+            if state["active"] == 5:
+                reached.set()
+            try:
+                await release.wait()
+                return True
+            finally:
+                state["active"] -= 1
+
+    async def scenario() -> None:
+        runtime = Runtime()
+        runtime.config.slots = 5
+        worker = ConcurrentWorker(client=Client(None), runtime=runtime, worker_id="oracle-room-01")
+        serving = asyncio.create_task(worker.serve(poll_seconds=0.1))
+        await asyncio.wait_for(reached.wait(), timeout=2)
+        assert state["maximum"] == 5
+        serving.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await serving
+
+    asyncio.run(scenario())
 
 
 def test_safe_exception_location_never_includes_exception_message() -> None:

@@ -13,7 +13,7 @@ from .models import JobRequest, JobResult, JobStatus
 from .runtime import HermesJobRuntime
 
 log = logging.getLogger(__name__)
-RUNTIME_VERSION = "0.3.0"
+RUNTIME_VERSION = "0.4.0"
 
 
 def _safe_exception_location(exc: BaseException) -> str:
@@ -245,30 +245,40 @@ class HubJobWorker:
             self._runtime_heartbeat_loop(runtime_stopped),
             name="hub-runtime-heartbeat",
         )
+        concurrency = max(1, self.runtime.config.slots)
+        active: set[asyncio.Task[bool]] = set()
         try:
             while True:
-                try:
-                    handled = await self.run_once()
-                except HubApiError as exc:
-                    log.warning(
-                        "Hub worker request failed status=%s code=%s",
-                        exc.status_code,
-                        exc.code,
-                    )
-                    handled = False
-                except Exception as exc:
-                    # Do not include the exception text: provider and tool failures
-                    # can contain material that must not reach durable host logs.
-                    log.error(
-                        "Hub worker job failed error_type=%s location=%s",
-                        type(exc).__name__,
-                        _safe_exception_location(exc),
-                    )
-                    handled = False
+                while len(active) < concurrency:
+                    active.add(asyncio.create_task(self._run_once_guarded()))
+                done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                handled = any(task.result() for task in done)
                 if not handled:
                     await asyncio.sleep(poll_seconds)
         finally:
+            for task in active:
+                task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
             runtime_stopped.set()
             runtime_heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await runtime_heartbeat
+
+    async def _run_once_guarded(self) -> bool:
+        try:
+            return await self.run_once()
+        except HubApiError as exc:
+            log.warning(
+                "Hub worker request failed status=%s code=%s",
+                exc.status_code,
+                exc.code,
+            )
+        except Exception as exc:
+            # Provider/tool failures can contain material that must not reach host logs.
+            log.error(
+                "Hub worker job failed error_type=%s location=%s",
+                type(exc).__name__,
+                _safe_exception_location(exc),
+            )
+        return False

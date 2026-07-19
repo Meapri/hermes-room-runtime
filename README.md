@@ -62,7 +62,7 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 
-docker build -t hermes-room-runtime:0.3.0 .
+docker build -t hermes-room-runtime:0.4.0 .
 pytest
 ruff check .
 ```
@@ -117,7 +117,7 @@ export HERMES_STATE_ROOT=/var/lib/hermes-room-runtime
 export HERMES_CONFIG_PATH=/etc/hermes-room-runtime/config.yaml
 export HERMES_PROVIDER_ENV_FILE=/run/secrets/hermes-provider.env
 export HERMES_NETWORK_MODE=actverse-hermes-egress
-export HERMES_SLOTS=2
+export HERMES_SLOTS=5
 
 hermes-room-worker
 ```

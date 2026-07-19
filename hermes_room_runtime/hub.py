@@ -85,7 +85,7 @@ class HubEvidenceLoader:
                 "Authorization": f"Bearer {_read_token(self.token_file)}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "hermes-room-runtime/0.3.0",
+                "User-Agent": "hermes-room-runtime/0.4.0",
                 **(headers or {}),
             },
         )
