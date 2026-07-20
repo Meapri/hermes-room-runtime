@@ -7,9 +7,12 @@ Before=hermes-room-worker.service
 
 [Service]
 Type=simple
-User=tinyproxy
-Group=tinyproxy
-ExecStart=/usr/bin/tinyproxy -d -c /etc/tinyproxy/actverse-hermes.conf
+ExecStartPre=-/usr/bin/docker rm -f actverse-hermes-egress-proxy
+ExecStartPre=/usr/bin/docker create --name actverse-hermes-egress-proxy --network actverse-hermes-proxy-egress --read-only --cap-drop=ALL --security-opt=no-new-privileges --memory=64m --pids-limit=64 -v /etc/tinyproxy/actverse-hermes.conf:/etc/tinyproxy/tinyproxy.conf:ro -v /etc/tinyproxy/actverse-hermes-allowlist:/etc/tinyproxy/actverse-hermes-allowlist:ro actverse-hermes-egress-proxy:1
+ExecStartPre=/usr/bin/docker network connect --ip 172.29.0.2 actverse-hermes-egress actverse-hermes-egress-proxy
+ExecStart=/usr/bin/docker start -a actverse-hermes-egress-proxy
+ExecStop=/usr/bin/docker stop -t 10 actverse-hermes-egress-proxy
+ExecStopPost=-/usr/bin/docker rm -f actverse-hermes-egress-proxy
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

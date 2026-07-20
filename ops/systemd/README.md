@@ -14,12 +14,13 @@ Keep the Hub worker token outside the repository. A minimal test deployment uses
 `HERMES_NETWORK_MODE=bridge`; production must replace this with a restricted model-proxy network. The worker token
 must contain only `agent-jobs:work`.
 
-Production uses an internal Docker network plus a host-side Tinyproxy listener bound only to that network gateway.
-Tinyproxy accepts only clients from the slot subnet, only permits CONNECT on port 443, and defaults to denying every
-destination except the checked-in ChatGPT/OpenAI allowlist. Install it and the network/proxy units first:
+Production uses an internal Docker network plus a dedicated Tinyproxy container connected to that network and a
+separate proxy-only egress network. Hermes slots remain attached only to the internal network. Tinyproxy accepts only
+clients from the slot subnet, only permits CONNECT on port 443, and defaults to denying every destination except the
+checked-in ChatGPT/OpenAI allowlist. Build the pinned proxy image and install the network/proxy units first:
 
 ```bash
-sudo apt-get install tinyproxy
+sudo docker build -t actverse-hermes-egress-proxy:1 -f ops/proxy/Dockerfile ops/proxy
 sudo install -o root -g root -m 0755 ops/systemd/ensure-hermes-egress-network.sh \
   /usr/local/libexec/ensure-hermes-egress-network
 sudo install -o root -g root -m 0644 \
