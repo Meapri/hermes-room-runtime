@@ -1,6 +1,6 @@
 # Hermes Room Runtime
 
-Actverse Evidence Hub와 Space 사이에서 Hermes 작업을 격리 실행하는 작은 Python 런타임이다.
+Actverse Evidence Hub의 Hermes 추론 작업과 Hercules QA 실행을 격리하는 Python 런타임이다.
 
 처음 버전은 카카오톡 대화방마다 장기 세션을 유지하는 구조였다. 현재 버전은 반대로 작업마다
 Hermes 상태를 폐기한다. Space는 무상태 소비자로 남고, Hub가 제공한 제한된 근거만 읽으며, 회사
@@ -10,21 +10,23 @@ Hermes 상태를 폐기한다. Space는 무상태 소비자로 남고, Hub가 �
 
 ```text
 Space
-  └─ Agent Jobs v1 작업 제출과 진행 상태 표시
+  └─ 상태·Finding·QA 실행 UI와 무상태 BFF
        ↓
 Evidence Hub
   ├─ Status API / Evidence API의 정본 데이터
-  └─ 작업 queue · lease · 결과 · 보존
-       ↓ worker lease + bounded JSON bundle (Hub token 제외)
+  ├─ Hermes Agent Jobs queue · lease · 구조화 결과
+  └─ Hercules QA Runs queue · Finding · 결과 · 증거 링크
+       ↓ lease + bounded bundle/manifest (Hub token 제외)
 Hermes Room Runtime
-  ├─ slot 0: job마다 새 container/HOME/HERMES_HOME/work
-  ├─ slot 1: job마다 새 container/HOME/HERMES_HOME/work
-  └─ 구조화 result를 Hub에 완료 기록 후 container와 작업 디렉터리 폐기
+  ├─ Hermes: one-shot container/HOME/HERMES_HOME/work
+  ├─ Hercules: digest-pinned ephemeral test container
+  └─ 두 결과를 Hub에 완료 기록한 뒤 작업 디렉터리 폐기
 ```
 
-런타임은 상태를 판정하거나 저장하지 않는다. `HubJobWorker`가 Agent Jobs v1에서 작업을 임대하고,
+런타임은 상태를 저장하지 않는다. `HubJobWorker`가 Agent Jobs v1과 QA Executor v1에서 작업을 임대하고,
 활성 lease에 묶인 Agent Evidence Bundle로 Hermes를 실행한 뒤 구조화 결과를 Hub에 완료 기록한다. queue와
-결과의 유일한 durable store는 Hub PostgreSQL이다.
+결과의 유일한 durable store는 Hub PostgreSQL이다. Hermes는 진단·제안·시나리오 작성만 하고,
+Hercules만 테스트를 실행한다.
 
 ## 이전 버전과 달라진 점
 
@@ -62,7 +64,7 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 
-docker build -t hermes-room-runtime:0.4.0 .
+docker build -t hermes-room-runtime:0.5.0 .
 pytest
 ruff check .
 ```
@@ -100,6 +102,10 @@ bundle = hub.status_bundle(environment="prod")
 - `POST /api/agent/v1/jobs/{job_id}/heartbeat`
 - `POST /api/agent/v1/jobs/{job_id}/complete`
 - `POST /api/agent/v1/workers/heartbeat`
+- `POST /api/qa/v1/executors/heartbeat`
+- `POST /api/qa/v1/executions/lease`
+- `POST /api/qa/v1/executions/{run_id}/heartbeat`
+- `POST /api/qa/v1/executions/{run_id}/complete`
 
 worker는 lease token과 worker ID가 일치할 때만 `agent-evidence-bundle-v1`을 읽는다. bundle의 작업
 정보·크기·구조·SHA-256이 계약과 다르면 Hermes를 실행하지 않고 작은 `inconclusive` 결과로 닫는다.
@@ -126,6 +132,11 @@ export HERMES_PROVIDER_ENV_FILE=/run/secrets/hermes-provider.env
 export HERMES_NETWORK_MODE=actverse-hermes-egress
 export HERMES_REQUIRE_RESTRICTED_NETWORK=true
 export HERMES_SLOTS=5
+export HERCULES_ENABLED=true
+export HERCULES_IMAGE=testzeus/hercules@sha256:11ff3700104f92230bafdff1e85f43b8932e8a7df5ab85b7f7d00d3cea61f52c
+export HERCULES_VERSION=0.1.2
+export HERCULES_STATE_ROOT=/var/lib/hermes-room-runtime/hercules
+export HERCULES_PROVIDER_ENV_FILE=/etc/hermes-room-runtime/hercules-provider.env
 
 hermes-room-worker
 ```
@@ -146,11 +157,16 @@ docker network create --internal \
 모델 proxy만 이 internal network와 별도 upstream network 양쪽에 연결한다. Hermes slot은 internal
 network 하나에만 연결하고 host 방화벽에서도 직접 egress를 차단한다.
 
+`HERCULES_PROVIDER_ENV_FILE`은 별도 파일이다. 최소 `LLM_MODEL_API_KEY`가 필요하고 보통
+`LLM_MODEL_NAME`, `LLM_MODEL_API_TYPE`도 함께 둔다. Hub/Space에는 이 자격증명을 저장하지 않는다.
+Hercules 이미지는 태그가 아니라 ARM64 manifest digest까지 고정하며, 실행 결과에서는 JUnit의
+bounded 요약과 버전/다이제스트/결과 해시만 Hub로 보낸다. 영상·원문 로그·고객 식별자는 폐기한다.
+
 ## Space 이행 결과
 
 1. Space는 Agent Jobs v1에 요청하고 목록·결과를 읽는 무상태 proxy다.
 2. Hub는 멱등 제출, worker lease, 재시도, 결과와 event 보존을 맡는다.
-3. Room Runtime host는 `agent-jobs:work`와 필요한 읽기 scope만 가진다.
+3. Room Runtime host는 `agent-jobs:work`와 `qa:work`만 가진다.
 4. Hermes slot에는 Hub token, lease token, Space DB가 전달되지 않는다.
 5. 운영 이행 전 named network, 전용 consumer token, 이미지 digest, slot 예산을 고정한다.
 

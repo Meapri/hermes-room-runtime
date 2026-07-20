@@ -10,6 +10,7 @@ import re
 import signal
 from pathlib import Path
 
+from .hercules import HerculesConfig, HerculesRuntime
 from .hub import HubAgentJobClient
 from .runtime import HermesJobRuntime, RuntimeConfig
 from .worker import SUPPORTED_TASK_KINDS, HubJobWorker
@@ -116,10 +117,28 @@ def build_worker_from_environment() -> tuple[HubJobWorker, float]:
         token_file=Path(_required("HUB_WORKER_TOKEN_FILE")),
         timeout_seconds=_float("HUB_TIMEOUT_SECONDS", 15),
     )
+    hercules = None
+    if _boolean("HERCULES_ENABLED", False):
+        hercules_env = _provider_env(_optional_path("HERCULES_PROVIDER_ENV_FILE"))
+        if "LLM_MODEL_API_KEY" not in hercules_env:
+            raise ValueError("Hercules requires a dedicated LLM provider credential")
+        hercules = HerculesRuntime(
+            HerculesConfig(
+                image=_required("HERCULES_IMAGE"),
+                version=_required("HERCULES_VERSION"),
+                state_root=Path(_required("HERCULES_STATE_ROOT")),
+                provider_env=hercules_env,
+                network_mode=os.environ.get("HERMES_NETWORK_MODE", "none"),
+                memory=os.environ.get("HERCULES_MEMORY", "4g"),
+                cpus=os.environ.get("HERCULES_CPUS", "2"),
+                pids_limit=_integer("HERCULES_PIDS_LIMIT", 1024),
+            )
+        )
     worker = HubJobWorker(
         client=client,
         runtime=runtime,
         worker_id=_required("HUB_WORKER_ID"),
+        hercules=hercules,
         task_kinds=task_kinds,
         lease_seconds=_integer("HUB_LEASE_SECONDS", 120),
         job_timeout_seconds=_float("HERMES_JOB_TIMEOUT_SECONDS", 300),

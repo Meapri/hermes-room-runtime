@@ -102,7 +102,7 @@ class HubEvidenceLoader:
                 "Authorization": f"Bearer {_read_token(self.token_file)}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "hermes-room-runtime/0.4.0",
+                "User-Agent": "hermes-room-runtime/0.5.0",
                 **(headers or {}),
             },
         )
@@ -229,6 +229,40 @@ class LeasedHubJob:
             options=options,
             lease_token=token,
         )
+
+
+@dataclass(frozen=True)
+class LeasedQaRun:
+    run: dict[str, Any]
+    lease_token: str
+
+    @classmethod
+    def from_response(cls, payload: dict[str, Any]) -> LeasedQaRun | None:
+        run = payload.get("run")
+        token = payload.get("lease_token")
+        if run is None and token is None:
+            return None
+        if (
+            payload.get("api_version") != "qa-executor-v1"
+            or not isinstance(run, dict)
+            or not isinstance(token, str)
+            or not 32 <= len(token) <= 256
+            or not isinstance(run.get("id"), int)
+            or not isinstance(run.get("watchdog_sec"), int)
+            or not isinstance(run.get("scenarios"), list)
+            or not run["scenarios"]
+        ):
+            raise HubApiError(0, "qa-lease-contract-invalid")
+        for scenario in run["scenarios"]:
+            if (
+                not isinstance(scenario, dict)
+                or not isinstance(scenario.get("slug"), str)
+                or not isinstance(scenario.get("definition_gherkin"), str)
+                or not isinstance(scenario.get("revision_sha"), str)
+                or _SHA256.fullmatch(scenario["revision_sha"]) is None
+            ):
+                raise HubApiError(0, "qa-lease-contract-invalid")
+        return cls(run=run, lease_token=token)
 
 
 @dataclass(frozen=True)
@@ -452,4 +486,69 @@ class HubAgentJobClient(HubEvidenceLoader):
                 "evidence_sha256": evidence_sha256,
                 "error_code": error_code,
             },
+        )
+
+    def qa_worker_heartbeat(
+        self,
+        *,
+        worker_id: str,
+        slots: int,
+        runtime_version: str,
+        hercules_version: str,
+        container_digest: str,
+        ttl_seconds: int = 60,
+    ) -> None:
+        response = self._request(
+            "POST",
+            "/api/qa/v1/executors/heartbeat",
+            payload={
+                "worker_id": worker_id,
+                "slots": slots,
+                "runtime_version": runtime_version,
+                "hercules_version": hercules_version,
+                "container_digest": container_digest,
+                "ttl_seconds": ttl_seconds,
+            },
+        )
+        if response.get("api_version") != "qa-executor-v1":
+            raise HubApiError(0, "qa-heartbeat-contract-invalid")
+
+    def qa_lease(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> LeasedQaRun | None:
+        response = self._request(
+            "POST",
+            "/api/qa/v1/executions/lease",
+            payload={"worker_id": worker_id, "lease_seconds": lease_seconds},
+        )
+        return LeasedQaRun.from_response(response)
+
+    def qa_heartbeat(
+        self,
+        leased: LeasedQaRun,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> None:
+        self._request(
+            "POST",
+            f"/api/qa/v1/executions/{leased.run['id']}/heartbeat",
+            headers={"X-QA-Lease-Token": leased.lease_token},
+            payload={"worker_id": worker_id, "lease_seconds": lease_seconds},
+        )
+
+    def qa_complete(
+        self,
+        leased: LeasedQaRun,
+        *,
+        completion: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/qa/v1/executions/{leased.run['id']}/complete",
+            headers={"X-QA-Lease-Token": leased.lease_token},
+            payload=completion,
         )

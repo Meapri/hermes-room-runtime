@@ -262,3 +262,58 @@ def test_worker_heartbeat_reports_only_bounded_runtime_capabilities(
         "heartbeat_ttl_seconds": 60,
     }
     assert "token" not in json.dumps(seen["body"]).lower()
+
+
+def test_qa_lease_and_completion_keep_token_in_host_header(tmp_path: Path, monkeypatch) -> None:
+    client = _agent_client(tmp_path)
+    lease_token = "qa-lease-token-that-is-long-enough-for-contract"  # noqa: S105
+    seen: list[dict] = []
+
+    def fake(request, **kwargs):
+        body = json.loads(request.data) if request.data else None
+        seen.append(
+            {
+                "url": request.full_url,
+                "lease": request.get_header("X-qa-lease-token"),
+                "body": body,
+            }
+        )
+        if request.full_url.endswith("/executions/lease"):
+            return _Response(
+                {
+                    "api_version": "qa-executor-v1",
+                    "run": {
+                        "id": 7,
+                        "watchdog_sec": 300,
+                        "scenarios": [
+                            {
+                                "slug": "public-check",
+                                "definition_gherkin": "Feature: public",
+                                "revision_sha": "b" * 64,
+                            }
+                        ],
+                    },
+                    "lease_token": lease_token,
+                }
+            )
+        return _Response({"api_version": "qa-executor-v1", "run": {"id": 7}})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake)
+    leased = client.qa_lease(worker_id="oracle-room-01", lease_seconds=300)
+    assert leased is not None
+    client.qa_complete(
+        leased,
+        completion={
+            "worker_id": "oracle-room-01",
+            "execution_status": "completed",
+            "test_outcome": "passed",
+            "results": [],
+            "result_sha256": "c" * 64,
+            "hercules_version": "0.1.2",
+            "container_digest": "sha256:" + "a" * 64,
+            "runtime_version": "0.5.0",
+        },
+    )
+    assert seen[0]["lease"] is None
+    assert seen[1]["lease"] == lease_token
+    assert lease_token not in json.dumps(seen[1]["body"])

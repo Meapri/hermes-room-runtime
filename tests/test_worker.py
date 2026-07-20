@@ -268,7 +268,7 @@ def test_worker_advertises_only_slots_that_are_actually_running() -> None:
     assert asyncio.run(worker._announce_runtime()) is True
     assert client.runtime_heartbeat is not None
     assert client.runtime_heartbeat["slots"] == 1
-    assert client.runtime_heartbeat["runtime_version"] == "0.4.0"
+    assert client.runtime_heartbeat["runtime_version"] == "0.5.0"
 
 
 def test_serve_runs_up_to_configured_slot_count_concurrently() -> None:

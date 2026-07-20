@@ -8,12 +8,13 @@ import logging
 import traceback
 from dataclasses import dataclass
 
+from .hercules import HerculesRuntime
 from .hub import HubAgentJobClient, HubApiError, LeasedHubJob
 from .models import JobRequest, JobResult, JobStatus, validate_hub_result
 from .runtime import HermesJobRuntime
 
 log = logging.getLogger(__name__)
-RUNTIME_VERSION = "0.4.0"
+RUNTIME_VERSION = "0.5.0"
 
 
 def _safe_exception_location(exc: BaseException) -> str:
@@ -88,6 +89,7 @@ class HubJobWorker:
     client: HubAgentJobClient
     runtime: HermesJobRuntime
     worker_id: str
+    hercules: HerculesRuntime | None = None
     task_kinds: tuple[str, ...] = SUPPORTED_TASK_KINDS
     lease_seconds: int = 120
     job_timeout_seconds: float = 300.0
@@ -158,20 +160,89 @@ class HubJobWorker:
                 continue
 
     async def _announce_runtime(self) -> bool:
-        if not await self.runtime.ensure():
+        announced = False
+        if await self.runtime.ensure():
+            health = await self.runtime.health()
+            if health.running_slots > 0:
+                await asyncio.to_thread(
+                    self.client.worker_heartbeat,
+                    worker_id=self.worker_id,
+                    task_kinds=list(self.task_kinds),
+                    slots=health.running_slots,
+                    runtime_version=RUNTIME_VERSION,
+                    heartbeat_ttl_seconds=self.runtime_heartbeat_ttl_seconds,
+                )
+                announced = True
+        if self.hercules is not None and await self.hercules.ensure():
+            await asyncio.to_thread(
+                self.client.qa_worker_heartbeat,
+                worker_id=self.worker_id,
+                slots=self.runtime.config.slots,
+                runtime_version=RUNTIME_VERSION,
+                hercules_version=self.hercules.config.version,
+                container_digest=self.hercules.config.digest,
+                ttl_seconds=self.runtime_heartbeat_ttl_seconds,
+            )
+            announced = True
+        return announced
+
+    async def _qa_heartbeat_loop(self, leased, stopped: asyncio.Event) -> None:
+        interval = max(20, self.lease_seconds // 3)
+        while True:
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                try:
+                    await asyncio.to_thread(
+                        self.client.qa_heartbeat,
+                        leased,
+                        worker_id=self.worker_id,
+                        lease_seconds=max(self.lease_seconds, 300),
+                    )
+                except HubApiError as exc:
+                    log.warning(
+                        "Hub QA heartbeat failed status=%s code=%s",
+                        exc.status_code,
+                        exc.code,
+                    )
+
+    async def _run_qa_once(self) -> bool:
+        if self.hercules is None or not await self.hercules.ensure():
             return False
-        health = await self.runtime.health()
-        if health.running_slots < 1:
-            return False
-        await asyncio.to_thread(
-            self.client.worker_heartbeat,
+        leased = await asyncio.to_thread(
+            self.client.qa_lease,
             worker_id=self.worker_id,
-            task_kinds=list(self.task_kinds),
-            slots=health.running_slots,
-            runtime_version=RUNTIME_VERSION,
-            heartbeat_ttl_seconds=self.runtime_heartbeat_ttl_seconds,
+            lease_seconds=max(self.lease_seconds, 300),
         )
-        return True
+        if leased is None:
+            return False
+        stopped = asyncio.Event()
+        heartbeat = asyncio.create_task(self._qa_heartbeat_loop(leased, stopped))
+        try:
+            result = await self.hercules.run(leased.run)
+            await asyncio.to_thread(
+                self.client.qa_complete,
+                leased,
+                completion=result.completion(
+                    worker_id=self.worker_id,
+                    config=self.hercules.config,
+                    runtime_version=RUNTIME_VERSION,
+                ),
+            )
+            return True
+        except Exception as exc:
+            log.error(
+                "Hercules execution failed error_type=%s location=%s",
+                type(exc).__name__,
+                _safe_exception_location(exc),
+            )
+            return True
+        finally:
+            stopped.set()
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError, HubApiError):
+                await heartbeat
 
     @staticmethod
     def _completion_status(result: JobResult) -> str:
@@ -256,6 +327,8 @@ class HubJobWorker:
         return status, record, error_code
 
     async def run_once(self) -> bool:
+        if await self._run_qa_once():
+            return True
         # Do not acquire a durable lease unless Docker and the restricted network
         # contract are ready. This keeps a bad host configuration fail-closed.
         if not await self.runtime.ensure():

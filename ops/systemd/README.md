@@ -12,7 +12,7 @@ Install the repository and virtual environment under `/opt/hermes-room-runtime`.
 
 Keep the Hub worker token outside the repository. A minimal test deployment uses one slot and can set
 `HERMES_NETWORK_MODE=bridge`; production must replace this with a restricted model-proxy network. The worker token
-must contain only `agent-jobs:work`.
+must contain only `agent-jobs:work,qa:work`.
 
 Production uses an internal Docker network plus a dedicated Tinyproxy container connected to that network and a
 separate proxy-only egress network. Hermes slots remain attached only to the internal network. Tinyproxy accepts only
@@ -44,6 +44,11 @@ HERMES_NETWORK_MODE=actverse-hermes-egress
 HERMES_REQUIRE_RESTRICTED_NETWORK=true
 HERMES_SLOTS=5
 HERMES_PROVIDER_ENV_FILE=/etc/hermes-room-runtime/provider.env
+HERCULES_ENABLED=true
+HERCULES_IMAGE=testzeus/hercules@sha256:11ff3700104f92230bafdff1e85f43b8932e8a7df5ab85b7f7d00d3cea61f52c
+HERCULES_VERSION=0.1.2
+HERCULES_STATE_ROOT=/var/lib/hermes-room-runtime/hercules
+HERCULES_PROVIDER_ENV_FILE=/etc/hermes-room-runtime/hercules-provider.env
 ```
 
 Create the group-private state root used by the host worker and the image's non-root user:
