@@ -32,7 +32,7 @@ sudo install -o root -g root -m 0644 \
   ops/systemd/tinyproxy.conf /etc/tinyproxy/actverse-hermes.conf
 sudo install -o root -g root -m 0644 \
   ops/systemd/hermes-egress-allowlist /etc/tinyproxy/actverse-hermes-allowlist
-sudo install -o root -g root -m 0600 ops/systemd/provider.env.example \
+sudo install -o root -g ubuntu -m 0640 ops/systemd/provider.env.example \
   /etc/hermes-room-runtime/provider.env
 ```
 
