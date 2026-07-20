@@ -9,7 +9,7 @@ import traceback
 from dataclasses import dataclass
 
 from .hub import HubAgentJobClient, HubApiError, LeasedHubJob
-from .models import JobRequest, JobResult, JobStatus
+from .models import JobRequest, JobResult, JobStatus, validate_hub_result
 from .runtime import HermesJobRuntime
 
 log = logging.getLogger(__name__)
@@ -19,6 +19,7 @@ RUNTIME_VERSION = "0.4.0"
 def _safe_exception_location(exc: BaseException) -> str:
     frames = traceback.extract_tb(exc.__traceback__)
     return " > ".join(f"{frame.name}:{frame.lineno}" for frame in frames[-4:]) or "unavailable"
+
 
 SUPPORTED_TASK_KINDS = (
     "incident-diagnosis",
@@ -44,6 +45,41 @@ _TASK_PROMPTS = {
         "Draft a validation scenario from evidence.json. Return objective, preconditions, steps, "
         "expected_results, and safety_constraints as JSON. Do not execute the scenario."
     ),
+}
+
+_TASK_RESULT_FIELDS = {
+    "incident-diagnosis": {
+        "summary",
+        "confidence",
+        "reason_codes",
+        "findings",
+        "recommended_actions",
+        "missing_evidence",
+    },
+    "finding-triage": {
+        "summary",
+        "severity",
+        "confidence",
+        "reason_codes",
+        "recommended_actions",
+        "missing_evidence",
+    },
+    "proposal-draft": {
+        "summary",
+        "risks",
+        "steps",
+        "validation",
+        "rollback",
+        "missing_evidence",
+    },
+    "scenario-authoring": {
+        "objective",
+        "preconditions",
+        "steps",
+        "expected_results",
+        "safety_constraints",
+        "missing_evidence",
+    },
 }
 
 
@@ -162,7 +198,68 @@ class HubJobWorker:
             error_code=error_code,
         )
 
+    async def _complete_inconclusive(
+        self,
+        job: LeasedHubJob,
+        *,
+        error_code: str,
+        summary: str,
+        missing_evidence: list[str] | None = None,
+        evidence_sha256: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self.client.complete,
+            job,
+            worker_id=self.worker_id,
+            status="inconclusive",
+            result={
+                "contract_version": "actverse-hermes-job-result/1.0",
+                "summary": summary,
+                "missing_evidence": missing_evidence or [error_code],
+            },
+            evidence_sha256=evidence_sha256,
+            error_code=error_code,
+        )
+
+    @staticmethod
+    def _safe_completion(
+        result: JobResult,
+        *,
+        allowed_result_fields: set[str],
+    ) -> tuple[str, dict, str | None]:
+        status = HubJobWorker._completion_status(result)
+        error_code = None if status == "succeeded" else result.error_code
+        record = result.as_record()
+        try:
+            if result.result is not None and not set(result.result).issubset(allowed_result_fields):
+                raise ValueError("result contains task-incompatible fields")
+            validate_hub_result(record)
+        except ValueError:
+            status = "inconclusive"
+            error_code = "result-policy-rejected"
+            record = {
+                "contract_version": "actverse-hermes-job-result/1.0",
+                "job_id": result.job_id,
+                "task_kind": result.task_kind,
+                "status": status,
+                "result": None,
+                "evidence_sha256": result.evidence_sha256,
+                "runtime": {
+                    "slot": result.slot,
+                    "duration_ms": result.duration_ms,
+                    "returncode": result.returncode,
+                    "error_code": error_code,
+                    "timed_out": result.timed_out,
+                },
+            }
+            validate_hub_result(record)
+        return status, record, error_code
+
     async def run_once(self) -> bool:
+        # Do not acquire a durable lease unless Docker and the restricted network
+        # contract are ready. This keeps a bad host configuration fail-closed.
+        if not await self.runtime.ensure():
+            return False
         job = await asyncio.to_thread(
             self.client.lease,
             worker_id=self.worker_id,
@@ -177,14 +274,45 @@ class HubJobWorker:
         try:
             try:
                 evidence = await asyncio.to_thread(
-                    self.client.status_bundle,
-                    job.environment,
+                    self.client.evidence_bundle,
+                    job,
+                    worker_id=self.worker_id,
                 )
             except HubApiError:
-                await self._complete_failure(
+                # A missing or incompatible lease-bound endpoint must not silently
+                # broaden the evidence scope by falling back to the status overview.
+                await self._complete_inconclusive(
                     job,
                     error_code="hub-evidence-unavailable",
-                    summary="The bounded Evidence Hub status bundle was unavailable.",
+                    summary="The lease-bound Evidence Hub bundle was unavailable.",
+                )
+                return True
+
+            policy = evidence["policy"]
+            gaps = evidence["gaps"]
+            reason_codes = evidence["reason_codes"]
+            facts = evidence["facts"]
+            allowed_result_fields = set(policy["allowed_result_fields"])
+            if allowed_result_fields != _TASK_RESULT_FIELDS[job.task_kind]:
+                await self._complete_inconclusive(
+                    job,
+                    error_code="hub-evidence-contract-invalid",
+                    summary="The evidence bundle result policy did not match the task contract.",
+                    evidence_sha256=evidence["bundle_sha256"],
+                )
+                return True
+            has_required_gap = policy["must_be_inconclusive_with_gaps"] and bool(
+                gaps or reason_codes
+            )
+            has_no_facts = policy["must_be_inconclusive_without_facts"] and not facts
+            if has_required_gap or has_no_facts:
+                await self._complete_inconclusive(
+                    job,
+                    error_code="hub-evidence-incomplete",
+                    summary="The lease-bound evidence requires an inconclusive result.",
+                    missing_evidence=list(dict.fromkeys(reason_codes or gaps))
+                    or ["evidence-bundle-empty"],
+                    evidence_sha256=evidence["bundle_sha256"],
                 )
                 return True
 
@@ -200,19 +328,21 @@ class HubJobWorker:
                     prompt=prompt,
                     evidence=evidence,
                     timeout_seconds=self.job_timeout_seconds,
+                    evidence_sha256_override=evidence["bundle_sha256"],
                 )
             )
-            completion_status = self._completion_status(runtime_result)
+            completion_status, completion_record, completion_error = self._safe_completion(
+                runtime_result,
+                allowed_result_fields=allowed_result_fields,
+            )
             await asyncio.to_thread(
                 self.client.complete,
                 job,
                 worker_id=self.worker_id,
                 status=completion_status,
-                result=runtime_result.as_record(),
+                result=completion_record,
                 evidence_sha256=runtime_result.evidence_sha256,
-                error_code=(
-                    None if completion_status == "succeeded" else runtime_result.error_code
-                ),
+                error_code=completion_error,
             )
             return True
         except HubApiError:
@@ -264,6 +394,7 @@ class HubJobWorker:
             runtime_heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await runtime_heartbeat
+            await self.runtime.shutdown()
 
     async def _run_once_guarded(self) -> bool:
         try:

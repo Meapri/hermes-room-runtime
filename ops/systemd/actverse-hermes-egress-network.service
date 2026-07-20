@@ -1,0 +1,13 @@
+[Unit]
+Description=Actverse restricted Hermes Docker network
+After=docker.service
+Requires=docker.service
+Before=actverse-hermes-egress-proxy.service hermes-room-worker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/ensure-hermes-egress-network
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

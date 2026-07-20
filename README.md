@@ -17,13 +17,13 @@ Evidence Hub
   └─ 작업 queue · lease · 결과 · 보존
        ↓ worker lease + bounded JSON bundle (Hub token 제외)
 Hermes Room Runtime
-  ├─ slot 0: job마다 새 HOME/HERMES_HOME/work
-  ├─ slot 1: job마다 새 HOME/HERMES_HOME/work
-  └─ 구조화 result를 Hub에 완료 기록 후 작업 디렉터리 폐기
+  ├─ slot 0: job마다 새 container/HOME/HERMES_HOME/work
+  ├─ slot 1: job마다 새 container/HOME/HERMES_HOME/work
+  └─ 구조화 result를 Hub에 완료 기록 후 container와 작업 디렉터리 폐기
 ```
 
 런타임은 상태를 판정하거나 저장하지 않는다. `HubJobWorker`가 Agent Jobs v1에서 작업을 임대하고,
-Status API의 제한된 근거 번들로 Hermes를 실행한 뒤 구조화 결과를 Hub에 완료 기록한다. queue와
+활성 lease에 묶인 Agent Evidence Bundle로 Hermes를 실행한 뒤 구조화 결과를 Hub에 완료 기록한다. queue와
 결과의 유일한 durable store는 Hub PostgreSQL이다.
 
 ## 이전 버전과 달라진 점
@@ -31,7 +31,7 @@ Status API의 제한된 근거 번들로 Hermes를 실행한 뒤 구조화 결�
 | 이전 카톡 룸 | 현재 Actverse 작업 런타임 |
 | --- | --- |
 | `room_id`마다 `--continue` | 모든 작업이 one-shot이며 대화를 재개하지 않음 |
-| room의 `~/.hermes`를 장기 보존 | 작업마다 새 `HOME`과 `HERMES_HOME`, 완료 후 폐기 |
+| room의 `~/.hermes`를 장기 보존 | 작업마다 container와 `HOME`·`HERMES_HOME`을 만들고 완료 후 폐기 |
 | 임의 room 수 생성 | CPU·메모리 예산이 고정된 slot pool |
 | 모델 키를 컨테이너 생성 환경에 보존 | 실행 시 0600 env-file로만 주입하고 즉시 삭제 |
 | bridge와 host gateway를 항상 허용 | 기본 `--network=none`, 운영에서는 제한된 named network를 명시 |
@@ -48,9 +48,9 @@ Status API의 제한된 근거 번들로 Hermes를 실행한 뒤 구조화 결�
 - Docker socket과 호스트 홈 미마운트
 - 회사 저장소 read-only mount
 - 작업별 증거 SHA-256과 최대 1 MiB 입력
-- 최대 512 KiB의 일반 JSON 객체만 결과로 허용
+- Hub와 같은 최대 256 KiB·깊이·민감정보 제한을 통과한 JSON 객체만 결과로 허용
 - stdout/stderr tail은 기본적으로 반환하지 않음
-- timeout 시 해당 slot container 재시작
+- 성공·실패·timeout·취소와 무관하게 해당 slot container를 삭제하고 새로 생성
 
 컨테이너는 VM이 아니다. 특히 `bridge` 네트워크는 일반 인터넷 egress를 차단하지 않는다. 운영에서는
 모델 프록시만 포함하는 별도 Docker network와 호스트 방화벽/egress proxy를 함께 사용해야 한다.
@@ -96,12 +96,19 @@ bundle = hub.status_bundle(environment="prod")
 `HubAgentJobClient`와 `HubJobWorker`는 다음 작업 계약을 사용한다.
 
 - `POST /api/agent/v1/jobs/lease`
+- `GET /api/agent/v1/jobs/{job_id}/evidence-bundle`
 - `POST /api/agent/v1/jobs/{job_id}/heartbeat`
 - `POST /api/agent/v1/jobs/{job_id}/complete`
 - `POST /api/agent/v1/workers/heartbeat`
 
-`journey_bundle()`에 입력한 원본 analysis ID는 Hub 요청 본문에서만 쓰며 반환 번들에는 복사하지
-않는다. HTTP 오류에는 token이나 응답 본문을 포함하지 않는다.
+worker는 lease token과 worker ID가 일치할 때만 `agent-evidence-bundle-v1`을 읽는다. bundle의 작업
+정보·크기·구조·SHA-256이 계약과 다르면 Hermes를 실행하지 않고 작은 `inconclusive` 결과로 닫는다.
+검증된 `bundle_sha256`을 completion의 `evidence_sha256`으로 그대로 돌려준다. policy가 근거 없음 또는
+gap·reason code 존재 시 `inconclusive`를 요구하면 facts가 일부 있어도 Hermes를 실행해 성공을 추정하지
+않는다.
+구형 Hub의 endpoint가 없을 때 status overview로 후퇴하지 않으므로 근거 범위가 묵시적으로 넓어지지
+않는다. `journey_bundle()`에 입력한 원본 analysis ID는 Hub 요청 본문에서만 쓰며 반환 번들에는
+복사하지 않는다. HTTP 오류에는 token이나 응답 본문을 포함하지 않는다.
 
 ## 지속 실행 worker
 
@@ -117,6 +124,7 @@ export HERMES_STATE_ROOT=/var/lib/hermes-room-runtime
 export HERMES_CONFIG_PATH=/etc/hermes-room-runtime/config.yaml
 export HERMES_PROVIDER_ENV_FILE=/run/secrets/hermes-provider.env
 export HERMES_NETWORK_MODE=actverse-hermes-egress
+export HERMES_REQUIRE_RESTRICTED_NETWORK=true
 export HERMES_SLOTS=5
 
 hermes-room-worker
@@ -124,7 +132,19 @@ hermes-room-worker
 
 `HERMES_PROVIDER_ENV_FILE`은 `KEY=value` 형식이며 `HUB_*`, `ACTVERSE_*` key는 거부한다. 따라서 Hub
 consumer token이나 lease token이 Hermes 환경으로 내려갈 수 없다. 기본 network는 `none`이다.
-모델 proxy가 필요한 운영 환경에서만 제한된 named network를 명시해야 한다.
+모델 proxy가 필요한 운영 환경에서는 `HERMES_REQUIRE_RESTRICTED_NETWORK=true`를 켠다. 이 모드는
+`none`·`bridge`·`default`를 거부하고 named network가 `Internal=true`이며
+`com.actverse.hermes-egress=restricted-v1` label을 가졌는지 매번 검사한다. network ID도 slot spec에
+포함하므로 같은 이름으로 network가 교체되면 기존 container를 재사용하지 않는다.
+
+```bash
+docker network create --internal \
+  --label com.actverse.hermes-egress=restricted-v1 \
+  actverse-hermes-egress
+```
+
+모델 proxy만 이 internal network와 별도 upstream network 양쪽에 연결한다. Hermes slot은 internal
+network 하나에만 연결하고 host 방화벽에서도 직접 egress를 차단한다.
 
 ## Space 이행 결과
 

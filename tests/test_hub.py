@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import urllib.error
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_room_runtime import HubAgentJobClient, HubApiError, HubEvidenceLoader
+from hermes_room_runtime import HubAgentJobClient, HubApiError, HubEvidenceLoader, LeasedHubJob
 
 
 class _Response:
@@ -152,6 +153,73 @@ def test_empty_agent_queue_has_no_lease_token(tmp_path: Path, monkeypatch) -> No
     )
 
     assert client.lease(worker_id="oracle-room-01", task_kinds=["incident-diagnosis"]) is None
+
+
+def test_lease_bound_evidence_bundle_is_verified_before_use(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = _agent_client(tmp_path)
+    job = LeasedHubJob(
+        job_id="018f7bc8-6bbd-7a00-8000-000000000099",
+        task_kind="incident-diagnosis",
+        environment="prod",
+        subject_ref="status:prod:video-analysis",
+        options={"locale": "ko", "force": False},
+        lease_token="lease-token-that-is-long-enough-for-the-contract",  # noqa: S106
+    )
+    unsigned = {
+        "api_version": "agent-evidence-bundle-v1",
+        "generated_at": "2026-07-20T00:00:00Z",
+        "window_hours": 24,
+        "job": {
+            "job_id": job.job_id,
+            "task_kind": job.task_kind,
+            "environment": job.environment,
+            "subject_ref": job.subject_ref,
+        },
+        "subject": {"kind": "component", "reference": "video-analysis"},
+        "policy": {
+            "allowed_result_fields": ["summary", "reason_codes"],
+            "must_report_gaps": True,
+            "must_be_inconclusive_with_gaps": True,
+            "must_be_inconclusive_without_facts": True,
+        },
+        "facts": [],
+        "gaps": ["evidence-bundle-empty"],
+        "reason_codes": ["evidence-bundle-empty"],
+        "truncated": False,
+    }
+    bundle = dict(unsigned)
+    bundle["bundle_sha256"] = hashlib.sha256(
+        json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    seen: dict = {}
+
+    def fake(request, **kwargs):
+        seen["url"] = request.full_url
+        seen["lease"] = request.get_header("X-agent-lease-token")
+        return _Response(bundle)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake)
+    fetched = client.evidence_bundle(job, worker_id="oracle-room-01")
+
+    assert fetched == bundle
+    assert seen["url"].endswith(
+        f"/api/agent/v1/jobs/{job.job_id}/evidence-bundle?worker_id=oracle-room-01"
+    )
+    assert seen["lease"] == job.lease_token
+
+    broken = dict(bundle)
+    broken["bundle_sha256"] = "0" * 64
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: _Response(broken))
+    with pytest.raises(HubApiError, match="evidence-bundle-digest-mismatch"):
+        client.evidence_bundle(job, worker_id="oracle-room-01")
 
 
 def test_worker_heartbeat_reports_only_bounded_runtime_capabilities(

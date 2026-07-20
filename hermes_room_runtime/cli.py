@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
+import signal
 from pathlib import Path
 
 from .hub import HubAgentJobClient
@@ -34,6 +36,18 @@ def _float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except ValueError as exc:
         raise ValueError(f"{name} must be numeric") from exc
+
+
+def _boolean(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _optional_path(name: str) -> Path | None:
@@ -88,6 +102,10 @@ def build_worker_from_environment() -> tuple[HubJobWorker, float]:
             auth_path=_optional_path("HERMES_AUTH_PATH"),
             provider_env=_provider_env(provider_env_file),
             network_mode=os.environ.get("HERMES_NETWORK_MODE", "none"),
+            require_restricted_network=_boolean(
+                "HERMES_REQUIRE_RESTRICTED_NETWORK",
+                False,
+            ),
             memory=os.environ.get("HERMES_MEMORY", "2g"),
             cpus=os.environ.get("HERMES_CPUS", "2"),
             pids_limit=_integer("HERMES_PIDS_LIMIT", 512),
@@ -111,10 +129,42 @@ def build_worker_from_environment() -> tuple[HubJobWorker, float]:
     return worker, _float("HUB_POLL_SECONDS", 2)
 
 
+async def _serve_with_signals(worker: HubJobWorker, poll_seconds: float) -> None:
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    installed: list[signal.Signals] = []
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(signum, stop.set)
+            installed.append(signum)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    serving = asyncio.create_task(worker.serve(poll_seconds=poll_seconds))
+    stopping = asyncio.create_task(stop.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {serving, stopping},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if serving in done:
+            await serving
+        else:
+            serving.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await serving
+    finally:
+        stopping.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stopping
+        for signum in installed:
+            loop.remove_signal_handler(signum)
+
+
 def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     worker, poll_seconds = build_worker_from_environment()
-    asyncio.run(worker.serve(poll_seconds=poll_seconds))
+    asyncio.run(_serve_with_signals(worker, poll_seconds))
 
 
 if __name__ == "__main__":

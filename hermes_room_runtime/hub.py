@@ -7,7 +7,9 @@ written into a room.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import ssl
 import urllib.error
 import urllib.parse
@@ -17,7 +19,22 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
+from .models import validate_hub_result
+
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_AGENT_BUNDLE_BYTES = 256 * 1024
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_REASON_CODE = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
+_SAFE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
+_FACT_KIND = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
+_SUBJECT_KINDS = {
+    "journey",
+    "component",
+    "problem",
+    "active-problems",
+    "analysis-timeline",
+    "unsupported",
+}
 
 
 class HubApiError(RuntimeError):
@@ -239,6 +256,138 @@ class HubAgentJobClient(HubEvidenceLoader):
             },
         )
         return LeasedHubJob.from_response(payload)
+
+    def evidence_bundle(
+        self,
+        job: LeasedHubJob,
+        *,
+        worker_id: str,
+    ) -> dict[str, Any]:
+        """Fetch and verify the bounded evidence tied to this exact active lease."""
+
+        bundle = self._request(
+            "GET",
+            f"/api/agent/v1/jobs/{job.job_id}/evidence-bundle",
+            query={"worker_id": worker_id},
+            headers={"X-Agent-Lease-Token": job.lease_token},
+        )
+        try:
+            encoded = json.dumps(
+                bundle,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise HubApiError(0, "evidence-bundle-invalid") from exc
+        if len(encoded) > _MAX_AGENT_BUNDLE_BYTES:
+            raise HubApiError(0, "evidence-bundle-too-large")
+        self._validate_evidence_bundle(bundle, job)
+        return bundle
+
+    @staticmethod
+    def _validate_evidence_bundle(bundle: dict[str, Any], job: LeasedHubJob) -> None:
+        expected_keys = {
+            "api_version",
+            "generated_at",
+            "window_hours",
+            "job",
+            "subject",
+            "policy",
+            "facts",
+            "gaps",
+            "reason_codes",
+            "truncated",
+            "bundle_sha256",
+        }
+        if set(bundle) != expected_keys or bundle.get("api_version") != "agent-evidence-bundle-v1":
+            raise HubApiError(0, "evidence-bundle-contract-invalid")
+        bundle_job = bundle.get("job")
+        subject = bundle.get("subject")
+        policy = bundle.get("policy")
+        facts = bundle.get("facts")
+        gaps = bundle.get("gaps")
+        reason_codes = bundle.get("reason_codes")
+        digest = bundle.get("bundle_sha256")
+        if (
+            not isinstance(bundle.get("generated_at"), str)
+            or bundle.get("window_hours") != 24
+            or not isinstance(bundle_job, dict)
+            or set(bundle_job) != {"job_id", "task_kind", "environment", "subject_ref"}
+            or bundle_job.get("job_id") != job.job_id
+            or bundle_job.get("task_kind") != job.task_kind
+            or bundle_job.get("environment") != job.environment
+            or bundle_job.get("subject_ref") != job.subject_ref
+            or not isinstance(subject, dict)
+            or set(subject) != {"kind", "reference"}
+            or subject.get("kind") not in _SUBJECT_KINDS
+            or not isinstance(subject.get("reference"), str)
+            or not 1 <= len(subject["reference"]) <= 128
+            or not isinstance(policy, dict)
+            or set(policy)
+            != {
+                "allowed_result_fields",
+                "must_report_gaps",
+                "must_be_inconclusive_with_gaps",
+                "must_be_inconclusive_without_facts",
+            }
+            or policy.get("must_report_gaps") is not True
+            or policy.get("must_be_inconclusive_with_gaps") is not True
+            or policy.get("must_be_inconclusive_without_facts") is not True
+            or not isinstance(policy.get("allowed_result_fields"), list)
+            or not 1 <= len(policy["allowed_result_fields"]) <= 12
+            or not all(
+                isinstance(field, str) and field for field in policy["allowed_result_fields"]
+            )
+            or not isinstance(facts, list)
+            or len(facts) > 32
+            or not isinstance(gaps, list)
+            or not isinstance(reason_codes, list)
+            or len(gaps) > 32
+            or len(reason_codes) > 32
+            or not isinstance(bundle.get("truncated"), bool)
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise HubApiError(0, "evidence-bundle-contract-invalid")
+        for values in (gaps, reason_codes):
+            if len(values) != len(set(values)) or any(
+                not isinstance(item, str) or _REASON_CODE.fullmatch(item) is None for item in values
+            ):
+                raise HubApiError(0, "evidence-bundle-contract-invalid")
+        for fact in facts:
+            if (
+                not isinstance(fact, dict)
+                or set(fact) != {"kind", "source", "observed_at", "fresh_until", "summary", "data"}
+                or not isinstance(fact.get("kind"), str)
+                or _FACT_KIND.fullmatch(fact["kind"]) is None
+                or not isinstance(fact.get("source"), str)
+                or _SAFE_REFERENCE.fullmatch(fact["source"]) is None
+                or not isinstance(fact.get("observed_at"), str)
+                or fact.get("fresh_until") is not None
+                and not isinstance(fact.get("fresh_until"), str)
+                or fact.get("summary") is not None
+                and (not isinstance(fact.get("summary"), str) or len(fact["summary"]) > 1024)
+                or not isinstance(fact.get("data"), dict)
+                or len(fact["data"]) > 32
+            ):
+                raise HubApiError(0, "evidence-bundle-contract-invalid")
+            try:
+                validate_hub_result(fact["data"])
+            except ValueError as exc:
+                raise HubApiError(0, "evidence-bundle-contract-invalid") from exc
+        unsigned = dict(bundle)
+        unsigned.pop("bundle_sha256")
+        calculated = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if calculated != digest:
+            raise HubApiError(0, "evidence-bundle-digest-mismatch")
 
     def worker_heartbeat(
         self,

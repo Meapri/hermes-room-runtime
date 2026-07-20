@@ -49,17 +49,40 @@ def test_live_docker_job_is_stateless_and_cleaned() -> None:
             for index in range(2)
         ]
         try:
-            return await asyncio.gather(*(runtime.run(request) for request in requests))
+            assert await runtime.ensure() is True
+            before = []
+            for slot in range(2):
+                code, stdout, _ = await runtime._docker(
+                    "inspect",
+                    "-f",
+                    "{{.Id}}",
+                    runtime._slot_name(slot),
+                )
+                assert code == 0
+                before.append(stdout.strip())
+            results = await asyncio.gather(*(runtime.run(request) for request in requests))
+            after = []
+            for slot in range(2):
+                code, stdout, _ = await runtime._docker(
+                    "inspect",
+                    "-f",
+                    "{{.Id}}",
+                    runtime._slot_name(slot),
+                )
+                assert code == 0
+                after.append(stdout.strip())
+            return results, before, after
         finally:
             await runtime.shutdown()
 
     try:
-        results = asyncio.run(exercise())
+        results, before, after = asyncio.run(exercise())
         assert [result.status for result in results] == [
             JobStatus.SUCCEEDED,
             JobStatus.SUCCEEDED,
         ], results
         assert {result.slot for result in results} == {0, 1}
+        assert all(old != new for old, new in zip(before, after, strict=True))
         assert [result.result["evidence_state"] for result in results] == [0, 1]
         assert not list((test_root / "state" / ".exec-env").iterdir())
         jobs = (test_root / "state" / "slots").glob("*/jobs")

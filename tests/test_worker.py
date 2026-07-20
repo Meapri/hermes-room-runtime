@@ -5,7 +5,9 @@ import contextlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from hermes_room_runtime import HubJobWorker, JobResult, JobStatus, LeasedHubJob
+import pytest
+
+from hermes_room_runtime import HubApiError, HubJobWorker, JobResult, JobStatus, LeasedHubJob
 from hermes_room_runtime.worker import _safe_exception_location
 
 
@@ -30,11 +32,28 @@ class Client:
     def lease(self, **kwargs):
         return self.job
 
-    def status_bundle(self, environment):
-        assert environment == "prod"
+    def evidence_bundle(self, job, *, worker_id):
+        assert job.environment == "prod"
+        assert worker_id == "oracle-room-01"
         return {
-            "bundle_version": "actverse-hermes-evidence/1.0",
-            "status": {"overall": {"state": "unknown"}},
+            "api_version": "agent-evidence-bundle-v1",
+            "bundle_sha256": "b" * 64,
+            "policy": {
+                "allowed_result_fields": [
+                    "summary",
+                    "confidence",
+                    "reason_codes",
+                    "findings",
+                    "recommended_actions",
+                    "missing_evidence",
+                ],
+                "must_report_gaps": True,
+                "must_be_inconclusive_with_gaps": True,
+                "must_be_inconclusive_without_facts": True,
+            },
+            "facts": [{"kind": "journey-status"}],
+            "gaps": [],
+            "reason_codes": [],
         }
 
     def heartbeat(self, *args, **kwargs):
@@ -53,6 +72,7 @@ class Client:
 class Runtime:
     seen_request: object | None = None
     running_slots: int = 2
+    shutdown_called: bool = False
 
     def __post_init__(self):
         self.config = SimpleNamespace(slots=2)
@@ -80,6 +100,9 @@ class Runtime:
             reason=None if self.running_slots == 2 else "slots-not-ready",
         )
 
+    async def shutdown(self):
+        self.shutdown_called = True
+
 
 class FailingRuntime(Runtime):
     async def run(self, request):
@@ -100,6 +123,7 @@ def test_worker_leases_hub_job_runs_stateless_runtime_and_completes_hub_record()
     assert _leased_job().lease_token not in str(runtime.seen_request.evidence)
     assert client.completed is not None
     assert client.completed["status"] == "succeeded"
+    assert client.completed["evidence_sha256"] == "b" * 64
     assert client.completed["result"]["result"] == {"summary": "bounded diagnosis"}
     assert "stdout_tail" not in client.completed["result"]
     assert "stderr_tail" not in client.completed["result"]
@@ -113,6 +137,107 @@ def test_worker_returns_false_without_creating_runtime_work_when_queue_is_empty(
     assert asyncio.run(worker.run_once()) is False
     assert runtime.seen_request is None
     assert client.completed is None
+
+
+def test_worker_does_not_lease_when_runtime_preflight_fails() -> None:
+    class NotReadyRuntime(Runtime):
+        async def ensure(self):
+            return False
+
+    class MustNotLease(Client):
+        def lease(self, **kwargs):
+            raise AssertionError("a fail-closed runtime must not acquire a lease")
+
+    worker = HubJobWorker(
+        client=MustNotLease(_leased_job()),
+        runtime=NotReadyRuntime(),
+        worker_id="oracle-room-01",
+    )
+    assert asyncio.run(worker.run_once()) is False
+
+
+def test_missing_lease_bound_bundle_closes_job_as_inconclusive_without_running() -> None:
+    class OldHubClient(Client):
+        def evidence_bundle(self, job, *, worker_id):
+            raise HubApiError(404, "request-failed")
+
+    client = OldHubClient(_leased_job())
+    runtime = Runtime()
+    worker = HubJobWorker(client=client, runtime=runtime, worker_id="oracle-room-01")
+
+    assert asyncio.run(worker.run_once()) is True
+    assert runtime.seen_request is None
+    assert client.completed is not None
+    assert client.completed["status"] == "inconclusive"
+    assert client.completed["error_code"] == "hub-evidence-unavailable"
+    assert client.completed["result"]["missing_evidence"] == ["hub-evidence-unavailable"]
+
+
+@pytest.mark.parametrize(
+    "facts,gaps,reason_codes",
+    [
+        ([], ["evidence-bundle-empty"], ["evidence-bundle-empty"]),
+        ([{"kind": "journey-status"}], ["recent-evidence-missing"], []),
+        ([{"kind": "journey-status"}], [], ["evidence-truncated"]),
+    ],
+)
+def test_bundle_policy_closes_gaps_as_inconclusive_without_running_hermes(
+    facts: list,
+    gaps: list[str],
+    reason_codes: list[str],
+) -> None:
+    class GapClient(Client):
+        def evidence_bundle(self, job, *, worker_id):
+            bundle = super().evidence_bundle(job, worker_id=worker_id)
+            return {**bundle, "facts": facts, "gaps": gaps, "reason_codes": reason_codes}
+
+    client = GapClient(_leased_job())
+    runtime = Runtime()
+    worker = HubJobWorker(client=client, runtime=runtime, worker_id="oracle-room-01")
+
+    assert asyncio.run(worker.run_once()) is True
+    assert runtime.seen_request is None
+    assert client.completed is not None
+    assert client.completed["status"] == "inconclusive"
+    assert client.completed["error_code"] == "hub-evidence-incomplete"
+    assert client.completed["evidence_sha256"] == "b" * 64
+    assert client.completed["result"]["missing_evidence"] == list(
+        dict.fromkeys(reason_codes or gaps)
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_result",
+    [
+        {"email": "person@example.com"},
+        {"findings": ["x" * 8000 for _ in range(40)]},
+        {"summary": "bounded", "debug": "not allowed for this task"},
+    ],
+)
+def test_worker_replaces_hub_incompatible_result_with_bounded_inconclusive_record(
+    unsafe_result: dict,
+) -> None:
+    class UnsafeRuntime(Runtime):
+        async def run(self, request):
+            return JobResult(
+                job_id=request.job_id,
+                task_kind=request.task_kind,
+                status=JobStatus.SUCCEEDED,
+                result=unsafe_result,
+                evidence_sha256=request.evidence_sha256,
+                slot=0,
+                duration_ms=25,
+            )
+
+    client = Client(_leased_job())
+    worker = HubJobWorker(client=client, runtime=UnsafeRuntime(), worker_id="oracle-room-01")
+
+    assert asyncio.run(worker.run_once()) is True
+    assert client.completed is not None
+    assert client.completed["status"] == "inconclusive"
+    assert client.completed["error_code"] == "result-policy-rejected"
+    assert client.completed["result"]["result"] is None
+    assert str(unsafe_result) not in str(client.completed)
 
 
 def test_worker_marks_unexpected_runtime_failure_terminal_without_waiting_for_lease_expiry(
@@ -173,6 +298,7 @@ def test_serve_runs_up_to_configured_slot_count_concurrently() -> None:
         serving.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await serving
+        assert runtime.shutdown_called is True
 
     asyncio.run(scenario())
 

@@ -1,6 +1,8 @@
+import math
+
 import pytest
 
-from hermes_room_runtime import JobRequest, JobResult, JobStatus
+from hermes_room_runtime import JobRequest, JobResult, JobStatus, validate_hub_result
 
 
 def test_job_request_is_bounded_and_stable() -> None:
@@ -17,6 +19,16 @@ def test_job_request_is_bounded_and_stable() -> None:
         evidence={"a": 1, "b": 2},
     )
     assert request.evidence_sha256 == same.evidence_sha256
+
+    bundle_digest = "b" * 64
+    bundle = JobRequest(
+        job_id="incident-43",
+        task_kind="incident-diagnosis",
+        prompt="diagnose",
+        evidence={"api_version": "agent-evidence-bundle-v1"},
+        evidence_sha256_override=bundle_digest,
+    )
+    assert bundle.evidence_sha256 == bundle_digest
 
 
 @pytest.mark.parametrize("value", ["../escape", "has space", "", "a" * 65])
@@ -51,3 +63,38 @@ def test_job_result_record_excludes_process_output() -> None:
     record = result.as_record()
     assert record["status"] == "failed"
     assert "stdout_tail" not in record and "stderr_tail" not in record
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"customer-email": "redacted"},
+        {"contact": "person@example.com"},
+        {"credential": "Bearer abcdefghijklmnopqrstuvwxyz"},
+        {"number": math.inf},
+        {"items": list(range(257))},
+        {"summary": "x" * 8193},
+        {"chain_of_thought": "hidden reasoning"},
+        {"chainofthought": "hidden reasoning"},
+        {"original_log": "raw"},
+        {"original_logs": ["raw"]},
+        {"raw_log": "raw"},
+        {"raw_logs": ["raw"]},
+        {"tool_trace": "raw"},
+        {"tool_traces": ["raw"]},
+    ],
+)
+def test_hub_result_validator_rejects_hub_incompatible_values(value: dict) -> None:
+    with pytest.raises(ValueError):
+        validate_hub_result(value)
+
+
+def test_hub_result_validator_accepts_bounded_structured_result() -> None:
+    validate_hub_result(
+        {
+            "summary": "No conclusive outage evidence.",
+            "confidence": 0.6,
+            "reason_codes": ["evidence-stale"],
+            "recommended_actions": ["Collect another bounded sample."],
+        }
+    )

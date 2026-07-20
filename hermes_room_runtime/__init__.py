@@ -1,7 +1,7 @@
 """Actverse-oriented isolated Hermes job runtime."""
 
 from .hub import HubAgentJobClient, HubApiError, HubEvidenceLoader, LeasedHubJob
-from .models import JobRequest, JobResult, JobStatus, RuntimeHealth
+from .models import JobRequest, JobResult, JobStatus, RuntimeHealth, validate_hub_result
 from .runtime import HermesJobRuntime, RuntimeConfig
 from .worker import HubJobWorker
 
@@ -20,4 +20,5 @@ __all__ = [
     "RuntimeHealth",
     "LeasedHubJob",
     "RUNTIME_VERSION",
+    "validate_hub_result",
 ]

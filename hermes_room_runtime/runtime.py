@@ -16,13 +16,15 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .models import JobRequest, JobResult, JobStatus, RuntimeHealth
+from .models import JobRequest, JobResult, JobStatus, RuntimeHealth, validate_hub_result
 
 _SAFE_RUNTIME_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _SAFE_ENV_KEY = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _SAFE_NETWORK = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$")
-_RESULT_LIMIT = 512 * 1024
+_RESULT_LIMIT = 256 * 1024
 _OUTPUT_TAIL = 4096
+_RESTRICTED_NETWORK_LABEL = "com.actverse.hermes-egress"
+_RESTRICTED_NETWORK_CONTRACT = "restricted-v1"
 
 
 def _docker_binary() -> str | None:
@@ -58,6 +60,7 @@ class RuntimeConfig:
     retain_job_dirs: bool = False
     include_output_tails: bool = False
     docker: str | None = field(default_factory=_docker_binary)
+    require_restricted_network: bool = False
 
     def __post_init__(self) -> None:
         if not self.image.strip() or any(ch.isspace() for ch in self.image):
@@ -68,6 +71,13 @@ class RuntimeConfig:
             raise ValueError("runtime_id contains unsafe characters")
         if self.network_mode == "host" or not _SAFE_NETWORK.fullmatch(self.network_mode):
             raise ValueError("network_mode must be none, bridge, or a safe named Docker network")
+        if self.require_restricted_network and self.network_mode in {
+            "none",
+            "bridge",
+            "default",
+            "host",
+        }:
+            raise ValueError("require_restricted_network needs a dedicated named Docker network")
         if not 16 <= self.pids_limit <= 4096:
             raise ValueError("pids_limit must be between 16 and 4096")
         if self.config_path is not None and not self.config_path.is_file():
@@ -101,6 +111,10 @@ class HermesJobRuntime:
         self._available: asyncio.Queue[int] | None = None
         self._ensured = False
         self._running_slots: set[int] = set()
+        self._quarantined_slots: set[int] = set()
+        self._lifecycle_generation = 0
+        self._stopped = False
+        self._network_id: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -112,10 +126,12 @@ class HermesJobRuntime:
     def _slot_root(self, slot: int) -> Path:
         return self.config.state_root / "slots" / f"slot-{slot}"
 
-    def _spec_hash(self) -> str:
+    def _spec_hash(self, network_id: str | None = None) -> str:
         spec = {
             "image": self.config.image,
             "network": self.config.network_mode,
+            "network_id": network_id,
+            "restricted_network": self.config.require_restricted_network,
             "memory": self.config.memory,
             "cpus": self.config.cpus,
             "pids": self.config.pids_limit,
@@ -129,9 +145,7 @@ class HermesJobRuntime:
             json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()[:20]
 
-    async def _docker(
-        self, *args: str, timeout: float = 30.0
-    ) -> tuple[int | None, bytes, bytes]:
+    async def _docker(self, *args: str, timeout: float = 30.0) -> tuple[int | None, bytes, bytes]:
         if self.config.docker is None:
             return None, b"", b"docker unavailable"
         proc = await asyncio.create_subprocess_exec(
@@ -146,6 +160,10 @@ class HermesJobRuntime:
             proc.kill()
             await proc.wait()
             return None, b"", b"timeout"
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
         return proc.returncode, stdout or b"", stderr or b""
 
     async def probe(self) -> bool:
@@ -154,9 +172,68 @@ class HermesJobRuntime:
         returncode, _, _ = await self._docker("info", timeout=20)
         return returncode == 0
 
+    async def _restricted_network_id(self) -> str | None:
+        if not self.config.require_restricted_network:
+            return None
+        returncode, stdout, _ = await self._docker(
+            "network",
+            "inspect",
+            "-f",
+            (f'{{{{.Id}}}}|{{{{.Internal}}}}|{{{{index .Labels "{_RESTRICTED_NETWORK_LABEL}"}}}}'),
+            self.config.network_mode,
+            timeout=15,
+        )
+        if returncode != 0:
+            return None
+        network_id, separator, remainder = stdout.decode("utf-8", "replace").strip().partition("|")
+        internal, second_separator, contract = remainder.partition("|")
+        if (
+            not separator
+            or not second_separator
+            or not network_id
+            or internal != "true"
+            or contract != _RESTRICTED_NETWORK_CONTRACT
+        ):
+            return None
+        return network_id
+
+    async def _container_has_exact_restricted_network(
+        self,
+        name: str,
+        network_id: str | None,
+    ) -> bool:
+        if not self.config.require_restricted_network:
+            return True
+        if network_id is None:
+            return False
+        returncode, stdout, _ = await self._docker(
+            "inspect",
+            "-f",
+            "{{json .NetworkSettings.Networks}}",
+            name,
+            timeout=15,
+        )
+        if returncode != 0:
+            return False
+        try:
+            networks = json.loads(stdout)
+        except (UnicodeDecodeError, ValueError):
+            return False
+        return (
+            isinstance(networks, dict)
+            and set(networks) == {self.config.network_mode}
+            and isinstance(networks[self.config.network_mode], dict)
+            and networks[self.config.network_mode].get("NetworkID") == network_id
+        )
+
     async def _ensure_slot(self, slot: int) -> bool:
         name = self._slot_name(slot)
-        expected = self._spec_hash()
+        network_id = await self._restricted_network_id()
+        if self.config.require_restricted_network and network_id is None:
+            return False
+        if self._network_id is not None and self._network_id != network_id:
+            return False
+        expected = self._spec_hash(network_id)
         returncode, stdout, _ = await self._docker(
             "inspect",
             "-f",
@@ -167,14 +244,22 @@ class HermesJobRuntime:
         if returncode == 0:
             state, _, found_spec = stdout.decode("utf-8", "replace").strip().partition("|")
             if found_spec != expected:
-                await self._docker("rm", "-f", name, timeout=30)
+                if not await self._purge_slot(slot):
+                    return False
             elif state == "running":
-                return True
+                if await self._container_has_exact_restricted_network(name, network_id):
+                    return True
+                if not await self._purge_slot(slot):
+                    return False
             else:
                 start_code, _, _ = await self._docker("start", name, timeout=30)
-                if start_code == 0:
+                if start_code == 0 and await self._container_has_exact_restricted_network(
+                    name,
+                    network_id,
+                ):
                     return True
-                await self._docker("rm", "-f", name, timeout=30)
+                if not await self._purge_slot(slot):
+                    return False
 
         slot_root = self._slot_root(slot)
         jobs_root = slot_root / "jobs"
@@ -217,20 +302,42 @@ class HermesJobRuntime:
             args += ["-e", f"{key}={value}"]
         args += ["--entrypoint", "tail", self.config.image, "-f", "/dev/null"]
         returncode, _, _ = await self._docker(*args, timeout=90)
-        return returncode == 0
+        if returncode != 0:
+            return False
+        if not await self._container_has_exact_restricted_network(name, network_id):
+            await self._purge_slot(slot)
+            return False
+        return True
 
     async def ensure(self) -> bool:
         if not await self.probe():
             return False
+        network_id = await self._restricted_network_id()
+        if self.config.require_restricted_network and network_id is None:
+            return False
         async with self._ensure_lock:
-            if self._ensured:
-                return bool(self._running_slots)
+            if self._network_id is not None and self._network_id != network_id:
+                return False
+            self._network_id = network_id
+            self._stopped = False
             self.config.state_root.mkdir(parents=True, exist_ok=True, mode=0o770)
             if stat.S_IMODE(self.config.state_root.stat().st_mode) != 0o770:
                 os.chmod(self.config.state_root, 0o770)
-            self._available = asyncio.Queue()
-            self._running_slots.clear()
+            if self._available is None:
+                self._available = asyncio.Queue()
             for slot in range(self.config.slots):
+                if slot in self._running_slots:
+                    if await self._container_has_exact_restricted_network(
+                        self._slot_name(slot),
+                        network_id,
+                    ):
+                        continue
+                    self._running_slots.discard(slot)
+                    self._quarantined_slots.add(slot)
+                if slot in self._quarantined_slots:
+                    if not await self._purge_slot(slot):
+                        continue
+                    self._quarantined_slots.discard(slot)
                 if await self._ensure_slot(slot):
                     self._running_slots.add(slot)
                     self._available.put_nowait(slot)
@@ -296,8 +403,7 @@ class HermesJobRuntime:
             "Mounted product repositories are read-only. Do not attempt to change them.\n"
             "Write the requested JSON object to result.json in the current working directory. "
             "Do not place credentials, raw customer identifiers, or unrelated source "
-            "payloads in it.\n\n"
-            + request.prompt
+            "payloads in it.\n\n" + request.prompt
         )
 
     @staticmethod
@@ -314,7 +420,50 @@ class HermesJobRuntime:
             return None, "result-invalid"
         if not isinstance(value, dict):
             return None, "result-invalid"
+        try:
+            validate_hub_result(value)
+        except ValueError:
+            return None, "result-policy-rejected"
         return value, None
+
+    async def _purge_slot(self, slot: int) -> bool:
+        """Remove a slot and verify that no old execution container survived."""
+
+        name = self._slot_name(slot)
+        await self._docker("rm", "-f", name, timeout=40)
+        inspect_code, _, inspect_stderr = await self._docker("inspect", name, timeout=15)
+        if inspect_code != 1:
+            return False
+        lowered = inspect_stderr.lower()
+        return b"no such object" in lowered or b"no such container" in lowered
+
+    async def _recycle_slot(
+        self,
+        slot: int,
+        generation: int,
+        job_root: Path | None,
+    ) -> None:
+        """Destroy all job processes, delete state, then create a clean execution shell."""
+
+        async with self._ensure_lock:
+            stale_generation = generation != self._lifecycle_generation or self._stopped
+            purged = await self._purge_slot(slot)
+            self._running_slots.discard(slot)
+            if job_root is not None and not self.config.retain_job_dirs:
+                shutil.rmtree(job_root, ignore_errors=True)
+            if not purged:
+                self._quarantined_slots.add(slot)
+                self._ensured = bool(self._running_slots)
+                return
+            self._quarantined_slots.discard(slot)
+            if stale_generation:
+                self._ensured = bool(self._running_slots)
+                return
+            if await self._ensure_slot(slot):
+                self._running_slots.add(slot)
+                if self._available is not None:
+                    self._available.put_nowait(slot)
+            self._ensured = bool(self._running_slots)
 
     async def run(self, request: JobRequest) -> JobResult:
         started = time.monotonic()
@@ -356,10 +505,14 @@ class HermesJobRuntime:
                 error_code="queue-timeout",
                 timed_out=True,
             )
+        generation = self._lifecycle_generation
         job_root: Path | None = None
         env_file: Path | None = None
         try:
-            if not await self._ensure_slot(slot):
+            async with self._ensure_lock:
+                generation = self._lifecycle_generation
+                slot_ready = not self._stopped and await self._ensure_slot(slot)
+            if not slot_ready:
                 return JobResult(
                     request.job_id,
                     request.task_kind,
@@ -386,6 +539,20 @@ class HermesJobRuntime:
                     error_code="queue-timeout",
                     timed_out=True,
                 )
+            if not await self._container_has_exact_restricted_network(
+                self._slot_name(slot),
+                self._network_id,
+            ):
+                return JobResult(
+                    request.job_id,
+                    request.task_kind,
+                    JobStatus.UNAVAILABLE,
+                    None,
+                    request.evidence_sha256,
+                    slot,
+                    int((time.monotonic() - started) * 1000),
+                    error_code="restricted-network-mismatch",
+                )
             returncode, stdout, stderr = await self._docker(
                 "exec",
                 "--env-file",
@@ -403,24 +570,29 @@ class HermesJobRuntime:
                 timeout=execution_timeout,
             )
             timed_out = returncode is None
-            if timed_out:
-                await self._docker("restart", self._slot_name(slot), timeout=40)
-            else:
+            if not timed_out:
                 # Hermes may use a restrictive umask. The fixed, non-symlink check lets the
                 # host worker read the group-owned result without making it world-readable.
-                await self._docker(
-                    "exec",
-                    "-w",
-                    f"{container_job}/work",
+                if await self._container_has_exact_restricted_network(
                     self._slot_name(slot),
-                    "sh",
-                    "-c",
-                    (
-                        "if [ -f result.json ] && [ ! -L result.json ]; "
-                        f"then chgrp {os.getgid()} result.json && chmod 0640 result.json; fi"
-                    ),
-                    timeout=10,
-                )
+                    self._network_id,
+                ):
+                    await self._docker(
+                        "exec",
+                        "-w",
+                        f"{container_job}/work",
+                        self._slot_name(slot),
+                        "sh",
+                        "-c",
+                        (
+                            "if [ -f result.json ] && [ ! -L result.json ]; "
+                            f"then chgrp {os.getgid()} result.json && chmod 0640 result.json; fi"
+                        ),
+                        timeout=10,
+                    )
+                else:
+                    returncode = 125
+                    stderr = b"restricted network membership changed"
             result, result_error = self._load_result(work / "result.json")
             if timed_out:
                 status = JobStatus.TIMED_OUT
@@ -459,9 +631,12 @@ class HermesJobRuntime:
         finally:
             if env_file is not None:
                 env_file.unlink(missing_ok=True)
-            if job_root is not None and not self.config.retain_job_dirs:
-                shutil.rmtree(job_root, ignore_errors=True)
-            self._available.put_nowait(slot)
+            recycle = asyncio.create_task(self._recycle_slot(slot, generation, job_root))
+            try:
+                await asyncio.shield(recycle)
+            except asyncio.CancelledError:
+                await recycle
+                raise
 
     async def health(self) -> RuntimeHealth:
         if not await self.probe():
@@ -499,8 +674,15 @@ class HermesJobRuntime:
         return removed
 
     async def shutdown(self) -> None:
-        for slot in range(self.config.slots):
-            await self._docker("rm", "-f", self._slot_name(slot), timeout=30)
-        self._ensured = False
-        self._running_slots.clear()
-        self._available = None
+        async with self._ensure_lock:
+            self._lifecycle_generation += 1
+            self._stopped = True
+            for slot in range(self.config.slots):
+                if not await self._purge_slot(slot):
+                    self._quarantined_slots.add(slot)
+                else:
+                    self._quarantined_slots.discard(slot)
+            self._ensured = False
+            self._running_slots.clear()
+            self._available = None
+            self._network_id = None

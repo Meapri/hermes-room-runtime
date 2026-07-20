@@ -51,3 +51,26 @@ def test_provider_environment_rejects_host_control_and_invalid_entries(
 
     with pytest.raises(ValueError):
         _provider_env(path)
+
+
+def test_restricted_network_environment_is_strict_boolean(tmp_path: Path, monkeypatch) -> None:
+    token = tmp_path / "hub.token"
+    token.write_text("h" * 40, encoding="utf-8")
+    values = {
+        "HUB_BASE_URL": "https://hub.example.test",
+        "HUB_WORKER_TOKEN_FILE": str(token),
+        "HUB_WORKER_ID": "oracle-room-01",
+        "HERMES_RUNTIME_IMAGE": "hermes-room-runtime:test",
+        "HERMES_STATE_ROOT": str(tmp_path / "state"),
+        "HERMES_NETWORK_MODE": "actverse-hermes-egress",
+        "HERMES_REQUIRE_RESTRICTED_NETWORK": "true",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    worker, _ = build_worker_from_environment()
+    assert worker.runtime.config.require_restricted_network is True
+
+    monkeypatch.setenv("HERMES_REQUIRE_RESTRICTED_NETWORK", "maybe")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        build_worker_from_environment()
