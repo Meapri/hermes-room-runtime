@@ -28,9 +28,9 @@ sudo install -o root -g root -m 0644 \
   ops/systemd/hermes-room-worker.service \
   /etc/systemd/system/
 sudo install -o root -g root -m 0644 \
-  ops/systemd/tinyproxy.conf \
-  ops/systemd/hermes-egress-allowlist \
-  /etc/hermes-room-runtime/
+  ops/systemd/tinyproxy.conf /etc/tinyproxy/actverse-hermes.conf
+sudo install -o root -g root -m 0644 \
+  ops/systemd/hermes-egress-allowlist /etc/tinyproxy/actverse-hermes-allowlist
 sudo install -o root -g root -m 0600 ops/systemd/provider.env.example \
   /etc/hermes-room-runtime/provider.env
 ```
