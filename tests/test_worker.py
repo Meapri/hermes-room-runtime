@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_room_runtime import HubApiError, HubJobWorker, JobResult, JobStatus, LeasedHubJob
-from hermes_room_runtime.worker import _safe_exception_location
+from hermes_room_runtime.worker import _idle_poll_delay, _safe_exception_location
 
 
 def _leased_job() -> LeasedHubJob:
@@ -311,3 +311,9 @@ def test_safe_exception_location_never_includes_exception_message() -> None:
 
     assert "test_safe_exception_location" in location
     assert "credential-looking-sensitive-value" not in location
+
+
+def test_idle_poll_delay_keeps_empty_queue_request_rate_stable_with_more_slots() -> None:
+    assert _idle_poll_delay(4, 1) == 4
+    assert _idle_poll_delay(4, 5) == 20
+    assert _idle_poll_delay(4, 32) == 60

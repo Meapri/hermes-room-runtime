@@ -162,6 +162,11 @@ network 하나에만 연결하고 host 방화벽에서도 직접 egress를 차�
 Hercules 이미지는 태그가 아니라 ARM64 manifest digest까지 고정하며, 실행 결과에서는 JUnit의
 bounded 요약과 버전/다이제스트/결과 해시만 Hub로 보낸다. 영상·원문 로그·고객 식별자는 폐기한다.
 
+Oracle에서는 Antigravity의 OpenAI 호환 `/v1` endpoint를 `LLM_MODEL_BASE_URL`로 사용할 수 있다.
+Hercules container는 host endpoint에 직접 연결하지 않고 restricted proxy의 명시적 allowlist를
+통과하며, `LLM_MODEL_NAME=gemini-3.5-flash-high`로 고정한다. proxy API key는 Runtime 전용
+provider 파일에만 둔다.
+
 ## Space 이행 결과
 
 1. Space는 Agent Jobs v1에 요청하고 목록·결과를 읽는 무상태 proxy다.

@@ -50,3 +50,19 @@ if [[ "$proxy_actual" != "$proxy_expected" ]]; then
   echo "refusing incompatible $proxy_network_name network: $proxy_actual" >&2
   exit 1
 fi
+
+# The external proxy container may call only the host-bound Antigravity OpenAI
+# endpoint. Keep this rule narrower than generic Docker-to-host access and place
+# it before the host's final reject rule. The tinyproxy destination allowlist is
+# a second, independent boundary.
+antigravity_port="8765"
+host_rule=(
+  -s "$proxy_network_subnet"
+  -d "$proxy_network_gateway"
+  -p tcp --dport "$antigravity_port"
+  -m conntrack --ctstate NEW
+  -j ACCEPT
+)
+if ! iptables -C INPUT "${host_rule[@]}" >/dev/null 2>&1; then
+  iptables -I INPUT 5 "${host_rule[@]}"
+fi

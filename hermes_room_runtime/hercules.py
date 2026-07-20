@@ -189,11 +189,15 @@ class HerculesRuntime:
         if _SAFE_SLUG.fullmatch(slug) is None or not 1 <= len(definition.encode()) <= 65536:
             return None, 2, False
         project = root / slug
+        project.mkdir(mode=0o707)
+        os.chmod(project, 0o707)
         for directory in ("input", "output", "test_data", "proofs", "log_files"):
-            (project / directory).mkdir(parents=True, mode=0o700)
+            path = project / directory
+            path.mkdir(mode=0o707)
+            os.chmod(path, 0o707)
         feature = project / "input" / "test.feature"
         feature.write_text(definition, encoding="utf-8")
-        os.chmod(feature, 0o600)
+        os.chmod(feature, 0o604)
         started = time.monotonic()
         code, _, _ = await self._docker(
             "run",
@@ -219,6 +223,36 @@ class HerculesRuntime:
             return None, None, True
         result = self._parse_result(project, slug, duration)
         return result, code, False
+
+    async def _cleanup(self, root: Path) -> None:
+        state_root = self.config.state_root.resolve()
+        resolved = root.resolve()
+        if resolved.parent != state_root or not resolved.name.startswith("qa-"):
+            return
+        shutil.rmtree(resolved, ignore_errors=True)
+        if not resolved.exists():
+            return
+        await self._docker(
+            "run",
+            "--rm",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--cap-add=DAC_OVERRIDE",
+            "--security-opt=no-new-privileges",
+            "--memory=128m",
+            "--cpus=0.25",
+            "--pids-limit=64",
+            "--user=0:0",
+            "--entrypoint=/bin/sh",
+            "-v",
+            f"{resolved}:/cleanup:rw",
+            self.config.image,
+            "-c",
+            "find /cleanup -mindepth 1 -delete",
+            timeout=30,
+        )
+        shutil.rmtree(resolved, ignore_errors=True)
 
     async def run(self, run: Mapping[str, Any]) -> HerculesResult:
         if not await self.ensure():
@@ -249,7 +283,7 @@ class HerculesRuntime:
             outcome = "failed" if any(item["outcome"] == "failed" for item in results) else "passed"
             return self._result("completed", outcome, None, last_code, results)
         finally:
-            shutil.rmtree(root, ignore_errors=True)
+            await self._cleanup(root)
 
     @staticmethod
     def _result(

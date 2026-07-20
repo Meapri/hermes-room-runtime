@@ -17,6 +17,11 @@ log = logging.getLogger(__name__)
 RUNTIME_VERSION = "0.5.0"
 
 
+def _idle_poll_delay(poll_seconds: float, concurrency: int) -> float:
+    """Keep aggregate empty-queue polling stable as the slot pool grows."""
+    return min(60.0, poll_seconds * max(1, concurrency))
+
+
 def _safe_exception_location(exc: BaseException) -> str:
     frames = traceback.extract_tb(exc.__traceback__)
     return " > ".join(f"{frame.name}:{frame.lineno}" for frame in frames[-4:]) or "unavailable"
@@ -449,6 +454,7 @@ class HubJobWorker:
             name="hub-runtime-heartbeat",
         )
         concurrency = max(1, self.runtime.config.slots)
+        idle_poll_seconds = _idle_poll_delay(poll_seconds, concurrency)
         active: set[asyncio.Task[bool]] = set()
         try:
             while True:
@@ -457,7 +463,7 @@ class HubJobWorker:
                 done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
                 handled = any(task.result() for task in done)
                 if not handled:
-                    await asyncio.sleep(poll_seconds)
+                    await asyncio.sleep(idle_poll_seconds)
         finally:
             for task in active:
                 task.cancel()
